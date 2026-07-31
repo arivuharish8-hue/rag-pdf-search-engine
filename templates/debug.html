@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Debug — PDF Search Engine</title>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,Helvetica,sans-serif; }
+        body { background:#f4f4f4; padding:40px; }
+        .container { max-width:800px; margin:auto; background:#fff; padding:30px; border-radius:12px; box-shadow:0 0 15px rgba(0,0,0,.1); }
+        h1 { text-align:center; margin-bottom:25px; color:#333; }
+        ul { list-style:none; padding:0; }
+        li { margin-bottom:12px; }
+        a { display:block; background:#f8f9fa; border:1px solid #e0e0e0; border-radius:8px; padding:14px 18px; color:#007bff; text-decoration:none; font-size:16px; }
+        a:hover { background:#e9ecef; }
+        p { color:#666; font-size:13px; margin-top:4px; }
+        .back { margin-top:25px; text-align:center; }
+        .back a { display:inline-block; background:transparent; border:none; color:#888; font-size:14px; padding:5px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Debug</h1>
+    <ul>
+        <li>
+            <a href="/debug/metadata">metadata.pkl integrity</a>
+            <p>Load metadata.pkl, inspect entries, compare count with FAISS index.</p>
+        </li>
+    </ul>
+    <div class="back"><a href="/">Back to main page</a></div>
+</div>
+</body>
+</html>

@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF Search Engine</title>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,Helvetica,sans-serif; }
+        body { background:#f4f4f4; padding:40px; }
+        .container { max-width:900px; margin:auto; background:#fff; padding:30px; border-radius:12px; box-shadow:0 0 15px rgba(0,0,0,.1); }
+        h1 { text-align:center; margin-bottom:25px; color:#333; }
+        h2 { margin-top:30px; margin-bottom:15px; color:#444; }
+        form { margin-bottom:30px; }
+        input[type=file], input[type=text] { width:100%; padding:12px; margin-top:10px; margin-bottom:15px; border:1px solid #ccc; border-radius:6px; font-size:16px; }
+        button { background:#007bff; color:#fff; border:none; padding:12px 20px; border-radius:6px; cursor:pointer; font-size:16px; }
+        button:hover { background:#0056b3; }
+
+        .result { background:#fafafa; border-left:5px solid #007bff; padding:15px; margin-bottom:15px; border-radius:8px; }
+        .score { color:green; font-weight:bold; margin-bottom:8px; }
+        .text { color:#333; line-height:1.6; }
+        .query-label { margin-bottom:10px; color:#555; font-size:14px; }
+
+        .stats { text-align:center; color:#888; font-size:13px; margin-bottom:10px; }
+
+        .pdf-list { list-style:none; padding:0; }
+        .pdf-card {
+            background:#f8f9fa; border:1px solid #e0e0e0; border-radius:8px;
+            padding:14px 18px; margin-bottom:10px;
+            display:flex; justify-content:space-between; align-items:center;
+        }
+        .pdf-info { flex:1; min-width:0; }
+        .pdf-name { font-weight:bold; color:#333; font-size:15px; word-break:break-all; }
+        .pdf-meta { font-size:12px; color:#888; margin-top:4px; display:flex; gap:15px; flex-wrap:wrap; }
+
+        .badge {
+            display:inline-block; font-size:11px; font-weight:bold;
+            padding:3px 8px; border-radius:4px; white-space:nowrap;
+        }
+        .badge-indexed { background:#e8f5e9; color:#1b5e20; }
+        .badge-processing { background:#fff3e0; color:#e65100; }
+        .badge-queued { background:#e3f2fd; color:#1565c0; }
+        .badge-failed { background:#ffebee; color:#b71c1c; }
+
+        .btn-delete {
+            background:#dc3545; color:#fff; border:none; padding:6px 14px;
+            border-radius:5px; cursor:pointer; font-size:13px; margin-left:12px;
+            white-space:nowrap;
+        }
+        .btn-delete:hover { background:#a71d2a; }
+
+        .empty { color:#aaa; text-align:center; padding:20px; font-size:14px; }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <h1>PDF Search Engine</h1>
+
+    <!-- Upload -->
+    <form method="POST" enctype="multipart/form-data">
+        <h2>Upload PDF</h2>
+        <input type="file" name="pdf" accept=".pdf" required>
+        <button type="submit">Upload PDF</button>
+    </form>
+
+    <!-- Dashboard -->
+    <h2>Uploaded PDFs</h2>
+    <div class="stats">Total vectors: {{ total_vectors }}</div>
+
+    {% if uploaded_pdfs %}
+    <ul class="pdf-list">
+        {% for pdf in uploaded_pdfs %}
+        <li class="pdf-card">
+            <div class="pdf-info">
+                <div class="pdf-name">{{ pdf.name }}</div>
+                <div class="pdf-meta">
+                    <span class="badge badge-{{ pdf.status }}">
+                        {% if pdf.status == "indexed" %}&#10003; Indexed
+                        {% elif pdf.status == "processing" %}&#9203; Processing
+                        {% elif pdf.status == "queued" %}&#9203; Queued
+                        {% elif pdf.status == "failed" %}&#10007; Failed
+                        {% else %}{{ pdf.status }}{% endif %}
+                    </span>
+                    <span>{{ pdf.chunks }} chunks</span>
+                    {% if pdf.created_at %}
+                    <span>{{ pdf.created_at[:10] }}</span>
+                    {% endif %}
+                </div>
+            </div>
+            <form method="POST" action="/delete/{{ pdf.name }}" onsubmit="return confirm('Delete {{ pdf.name }}?')">
+                <button type="submit" class="btn-delete">Delete</button>
+            </form>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty">No PDFs uploaded yet.</div>
+    {% endif %}
+
+    <!-- Search -->
+    <form method="POST">
+        <h2>Search Query</h2>
+        <input type="text" name="query" placeholder="Enter your question..." value="{{ query }}" required>
+        <button type="submit">Search</button>
+    </form>
+
+    <!-- Answer -->
+    {% if answer %}
+    <h2>Answer</h2>
+    <div class="result">
+        <div class="query-label"><strong>Query:</strong> {{ query }}</div>
+        <div class="text">{{ answer }}</div>
+    </div>
+    {% endif %}
+
+    <!-- Results -->
+    {% if results %}
+    <h2>Top Results</h2>
+    {% for result in results %}
+    <div class="result">
+        <div class="score">Similarity Score: {{ result.score }}</div>
+        <div><strong>PDF:</strong> {{ result.pdf_name | default("Unknown") }}</div>
+        <div><strong>Page:</strong> {{ result.page }}</div>
+        <div><strong>Chunk:</strong> {{ result.chunk }}</div>
+        <div class="text"><strong>Text:</strong> {{ result.text }}</div>
+    </div>
+    {% endfor %}
+    {% endif %}
+
+</div>
+
+<script>
+(function() {
+    var pending = document.querySelectorAll('.badge-processing, .badge-queued');
+    if (pending.length === 0) return;
+
+    function pollAll() {
+        var still = false;
+        document.querySelectorAll('.pdf-card').forEach(function(card) {
+            var badge = card.querySelector('.badge');
+            if (!badge) return;
+            var cls = badge.className;
+            if (cls.indexOf('indexed') !== -1 || cls.indexOf('failed') !== -1) return;
+
+            var name = card.querySelector('.pdf-name');
+            if (!name) return;
+
+            still = true;
+            fetch('/pdfs')
+                .then(function(r) { return r.json(); })
+                .then(function(pdfs) {
+                    var match = pdfs.find(function(p) { return p.name === name.textContent; });
+                    if (match) {
+                        var labels = {indexed:'&#10003; Indexed',processing:'&#9203; Processing',queued:'&#9203; Queued',failed:'&#10007; Failed'};
+                        badge.innerHTML = labels[match.status] || match.status;
+                        badge.className = 'badge badge-' + match.status;
+                        var meta = card.querySelector('.pdf-meta');
+                        if (meta) {
+                            var spans = meta.querySelectorAll('span');
+                            if (spans[1]) spans[1].textContent = match.chunks + ' chunks';
+                        }
+                    }
+                });
+        });
+        if (still) setTimeout(pollAll, 3000);
+    }
+    setTimeout(pollAll, 2000);
+})();
+</script>
+
+</body>
+</html>
