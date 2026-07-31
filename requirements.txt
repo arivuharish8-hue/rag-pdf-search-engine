@@ -11,3 +11,5 @@ torch>=2.2.0
 transformers>=4.44.0
 huggingface-hub>=0.34.0
 google-genai
+celery[amqp]>=5.4.0
+gunicorn>=23.0.0

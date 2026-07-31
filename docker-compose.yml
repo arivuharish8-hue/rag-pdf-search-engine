@@ -1,0 +1,86 @@
+version: "3.9"
+
+# PDF RAG Search Engine — production-style topology
+#
+#   flask          → only accepts HTTP requests (upload / search / delete)
+#   rabbitmq       → only transports messages
+#   celery-worker  → all heavy processing (download, extract, embed, index)
+#
+# ./uploads  and  ./database  are shared bind-mounts so the worker can write
+# PDFs + faiss.index + metadata.pkl that Flask reads.
+#
+# Required environment: set SUPABASE_URL / SUPABASE_SECRET_KEY / SUPABASE_BUCKET /
+# FLASK_SECRET_KEY / GEMINI_API_KEY in .env (see .env.example).
+#
+#   docker compose up --build
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: pdf-rag-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-guest}
+    ports:
+      - "5672:5672"    # AMQP (broker)
+      - "15672:15672"  # Management UI (guest/guest)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  celery-worker:
+    build: .
+    container_name: pdf-rag-worker
+    command: >
+      celery -A celery_app worker
+      --loglevel=info
+      --concurrency=2
+      --prefetch-multiplier=1
+      --queues=pdf_processing,celery
+    env_file: .env
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASS:-guest}@rabbitmq:5672//
+    volumes:
+      - ./uploads:/app/uploads
+      - ./database:/app/database
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "celery", "-A", "celery_app", "inspect", "ping", "--timeout", "5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  flask:
+    build: .
+    container_name: pdf-rag-flask
+    command: gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 180 app:app
+    env_file: .env
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASS:-guest}@rabbitmq:5672//
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./database:/app/database
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  rabbitmq_data:

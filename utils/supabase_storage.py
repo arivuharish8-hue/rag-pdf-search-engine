@@ -1,8 +1,11 @@
 """Supabase Storage helpers."""
 
+import logging
 import os
+
 from supabase import create_client
 
+logger = logging.getLogger(__name__)
 
 _client = None
 
@@ -39,14 +42,23 @@ def list_files():
 
 
 def delete_file(path):
-    """Delete a single file from Supabase Storage."""
+    """Delete a single file from Supabase Storage.
+
+    Returns True on success.  Raises RuntimeError with a meaningful message
+    when the deletion fails so callers never mistake a failed removal for
+    success.  Supabase Storage remove() is idempotent for missing objects.
+    """
     try:
         client = get_client()
         client.storage.from_(get_bucket()).remove([path])
+        logger.info("[Supabase] Deleted %s from bucket %s", path, get_bucket())
         return True
     except Exception as e:
-        print(f"[Supabase] delete_file error: {e}")
-        return False
+        logger.error("[Supabase] delete_file error for %s: %s",
+                     path, e, exc_info=True)
+        raise RuntimeError(
+            f"Failed to delete '{path}' from Supabase Storage: {e}"
+        ) from e
 
 
 def upload_file(local_path, object_name):
@@ -58,3 +70,12 @@ def upload_file(local_path, object_name):
             file=f.read(),
             file_options={"content-type": "application/pdf"},
         )
+
+
+def download_file(object_name, local_path):
+    """Download a file from Supabase Storage to a local path."""
+    client = get_client()
+    data = client.storage.from_(get_bucket()).download(object_name)
+    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+    with open(local_path, "wb") as f:
+        f.write(data)

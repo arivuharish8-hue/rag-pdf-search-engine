@@ -151,6 +151,34 @@ def save_checkpoint(job_id, last_processed_chunk, **kwargs):
     update_job_status(job_id, **kwargs)
 
 
+def try_claim_job(job_id):
+    """Atomically claim a job for processing. Returns True if claimed.
+
+    The status transition is the lock: a job may only be claimed while it is
+    in a non-terminal state (UPLOADED / PROCESSING).  This prevents two
+    workers from processing the same job_id at once and also lets a
+    redelivered task re-claim a job left in PROCESSING by a crashed worker
+    (crash-resume).
+    """
+    if _detect_backend():
+        result = (
+            _SUPABASE_TABLE.update({"status": "PROCESSING"})
+            .eq("job_id", job_id)
+            .not_.in_("status", ["COMPLETED", "FAILED"])
+            .execute()
+        )
+        return bool(result.data)
+    with _JSON_LOCK:
+        data = _read_json()
+        job = data.get(job_id)
+        if job is None or job["status"] in ("COMPLETED", "FAILED"):
+            return False
+        job["status"] = "PROCESSING"
+        job["updated_at"] = _now()
+        _write_json(data)
+        return True
+
+
 def get_pending_jobs():
     """Return all jobs where status is NOT COMPLETED nor FAILED, oldest first."""
     if _detect_backend():
@@ -231,3 +259,27 @@ def delete_job(job_id):
             data.pop(job_id, None)
             _write_json(data)
     logger.info("[DB] Job %s deleted", job_id)
+
+
+def delete_jobs_for_pdf(pdf_name):
+    """Delete every processing_jobs row belonging to one PDF.
+
+    Used by the delete pipeline before FAISS removal so an in-flight Celery
+    stage finds no job and stops instead of re-adding vectors.  Returns the
+    number of rows removed.
+    """
+    if _detect_backend():
+        result = _SUPABASE_TABLE.delete().eq("pdf_name", pdf_name).execute()
+        count = len(result.data) if result.data else 0
+    else:
+        with _JSON_LOCK:
+            data = _read_json()
+            to_delete = [jid for jid, j in data.items()
+                         if j.get("pdf_name") == pdf_name]
+            for jid in to_delete:
+                data.pop(jid, None)
+            count = len(to_delete)
+            if count:
+                _write_json(data)
+    logger.info("[DB] Deleted %d job(s) for %s", count, pdf_name)
+    return count

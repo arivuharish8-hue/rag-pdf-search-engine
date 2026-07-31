@@ -47,6 +47,18 @@
             white-space:nowrap;
         }
         .btn-delete:hover { background:#a71d2a; }
+        .btn-delete:disabled { background:#b3b3b3; cursor:not-allowed; }
+
+        .status { margin:10px 0; padding:10px 14px; border-radius:6px; font-size:14px; display:none; }
+        .status.info { background:#e3f2fd; color:#1565c0; border:1px solid #90caf9; }
+        .status.success { background:#e8f5e9; color:#1b5e20; border:1px solid #a5d6a7; }
+        .status.error { background:#ffebee; color:#b71c1c; border:1px solid #ef9a9a; }
+        .spinner {
+            display:inline-block; width:13px; height:13px; border:2px solid #fff;
+            border-top-color:transparent; border-radius:50%; margin-right:6px;
+            vertical-align:-2px; animation:spin .8s linear infinite;
+        }
+        @keyframes spin { to { transform:rotate(360deg); } }
 
         .empty { color:#aaa; text-align:center; padding:20px; font-size:14px; }
     </style>
@@ -65,7 +77,8 @@
 
     <!-- Dashboard -->
     <h2>Uploaded PDFs</h2>
-    <div class="stats">Total vectors: {{ total_vectors }}</div>
+    <div class="stats" id="total-vectors">Total vectors: {{ total_vectors }}</div>
+    <div id="delete-status" class="status" role="status" aria-live="polite"></div>
 
     {% if uploaded_pdfs %}
     <ul class="pdf-list">
@@ -87,9 +100,7 @@
                     {% endif %}
                 </div>
             </div>
-            <form method="POST" action="/delete/{{ pdf.name }}" onsubmit="return confirm('Delete {{ pdf.name }}?')">
-                <button type="submit" class="btn-delete">Delete</button>
-            </form>
+            <button type="button" class="btn-delete" data-name="{{ pdf.name }}">Delete</button>
         </li>
         {% endfor %}
     </ul>
@@ -131,6 +142,75 @@
 
 <script>
 (function() {
+    var statusBox = document.getElementById('delete-status');
+
+    function showStatus(text, type) {
+        if (!statusBox) return;
+        statusBox.textContent = text;
+        statusBox.className = 'status ' + (type || 'info');
+        statusBox.style.display = 'block';
+        clearTimeout(showStatus._t);
+        showStatus._t = setTimeout(function() {
+            statusBox.style.display = 'none';
+        }, 6000);
+    }
+
+    function updateTotalVectors(total) {
+        var el = document.getElementById('total-vectors');
+        if (el && typeof total === 'number') {
+            el.textContent = 'Total vectors: ' + total;
+        }
+    }
+
+    // ── Delete flow: disable button → DELETE → remove card / show result ──
+    document.querySelectorAll('.btn-delete').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            if (btn.disabled) return;
+            var name = btn.getAttribute('data-name');
+            var card = btn.closest('.pdf-card');
+            if (!name) return;
+            if (!confirm('Delete ' + name + '?')) return;
+
+            btn.disabled = true;
+            var original = btn.textContent;
+            btn.innerHTML = '<span class="spinner"></span>Deleting...';
+            showStatus('Deleting ' + name + '...', 'info');
+
+            fetch('/delete/' + encodeURIComponent(name), { method: 'DELETE' })
+                .then(function(resp) {
+                    return resp.json().catch(function() { return {}; })
+                        .then(function(body) { return { code: resp.status, body: body }; });
+                })
+                .then(function(res) {
+                    var code = res.code;
+                    var body = res.body || {};
+
+                    if (code === 200 || code === 404) {
+                        if (card) card.remove();
+                        updateTotalVectors(body.total_vectors);
+                        showStatus(code === 200
+                            ? 'Deleted successfully: ' + name
+                            : 'Deleted successfully (already gone): ' + name,
+                            'success');
+                    } else if (code === 500 && body.deleted) {
+                        if (card) card.remove();
+                        updateTotalVectors(body.total_vectors);
+                        showStatus('Deleted with errors: ' + (body.error || 'unknown'), 'error');
+                    } else {
+                        btn.disabled = false;
+                        btn.textContent = original;
+                        showStatus('Delete failed: ' + (body.error || ('HTTP ' + code)), 'error');
+                    }
+                })
+                .catch(function(err) {
+                    btn.disabled = false;
+                    btn.textContent = original;
+                    showStatus('Delete failed: ' + err.message, 'error');
+                });
+        });
+    });
+
+    // ── Poll processing/queued badges ──
     var pending = document.querySelectorAll('.badge-processing, .badge-queued');
     if (pending.length === 0) return;
 

@@ -2,7 +2,6 @@
 
 import logging
 import os
-import threading
 
 from dotenv import load_dotenv
 from flask import (
@@ -25,13 +24,8 @@ from utils.faiss_db import (
     total_vectors,
 )
 from utils.gemini import GeminiGenerationError, generate_answer
-from utils.database import get_job, get_all_jobs, delete_job
-from utils.processing import (
-    start_processing,
-    resume_processing,
-    retry_failed_jobs,
-    background_worker,
-)
+from utils.database import get_job, get_all_jobs, delete_jobs_for_pdf
+from utils.processing import start_processing, resume_pending_jobs
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -115,17 +109,85 @@ def get_uploaded_pdfs():
     return pdfs
 
 
-def delete_pdf(pdf_name):
-    delete_file(pdf_name)
-    remove_pdf(pdf_name)
+class DeleteNotFound(Exception):
+    """Raised when the PDF exists nowhere that we could delete it from."""
 
-    for job in get_all_jobs():
-        if job["pdf_name"] == pdf_name:
-            delete_job(job["job_id"])
+
+class DeleteFailed(Exception):
+    """Raised when a critical delete step fails before any partial change."""
+
+
+def delete_pdf(pdf_name):
+    """Remove a PDF end-to-end: Supabase Storage, processing_jobs, FAISS, disk.
+
+    Ordered for atomicity / rollback:
+      1. Supabase Storage (source of truth) — on failure nothing has changed
+         yet, so the delete aborts cleanly with a meaningful error.
+      2. processing_jobs rows — removed BEFORE the index so an in-flight
+         Celery stage finds no job and stops instead of re-adding vectors.
+      3. FAISS vectors + metadata (persists faiss.index + metadata.pkl).
+      4. Local download-cache copy.
+
+    Returns a summary dict.  Failures in the non-critical steps 2-4 are
+    logged with the exact error and collected in summary["errors"] so the
+    caller can still report a partial deletion with the right HTTP status.
+    """
+    storage_names = {f.get("name", "") for f in list_files()}
+    storage_exists = pdf_name in storage_names
+    vectors_before = get_pdf_chunk_count(pdf_name)
+    job_ids = [j["job_id"] for j in get_all_jobs()
+               if j["pdf_name"] == pdf_name]
+
+    if not storage_exists and vectors_before == 0 and not job_ids:
+        raise DeleteNotFound(f"PDF '{pdf_name}' not found or already deleted")
+
+    errors = []
+
+    if storage_exists:
+        try:
+            delete_file(pdf_name)
+        except Exception as exc:
+            logger.error("[Delete] Supabase deletion failed for %s: %s",
+                         pdf_name, exc, exc_info=True)
+            raise DeleteFailed(
+                f"Supabase deletion failed for '{pdf_name}': {exc}"
+            ) from exc
+    else:
+        logger.info("[Delete] %s already absent from Supabase — continuing "
+                    "cleanup", pdf_name)
+
+    try:
+        delete_jobs_for_pdf(pdf_name)
+    except Exception as exc:
+        logger.error("[Delete] processing_jobs deletion failed for %s: %s",
+                     pdf_name, exc, exc_info=True)
+        errors.append(f"processing_jobs: {exc}")
+
+    try:
+        remove_pdf(pdf_name)
+    except Exception as exc:
+        logger.error("[Delete] FAISS removal failed for %s: %s",
+                     pdf_name, exc, exc_info=True)
+        errors.append(f"faiss: {exc}")
 
     local_path = os.path.join(UPLOAD_FOLDER, pdf_name)
-    if os.path.exists(local_path):
-        os.remove(local_path)
+    try:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+    except OSError as exc:
+        logger.error("[Delete] local file removal failed for %s: %s",
+                     pdf_name, exc, exc_info=True)
+        errors.append(f"local_file: {exc}")
+
+    return {
+        "pdf_name": pdf_name,
+        "deleted": True,
+        "storage_deleted": storage_exists,
+        "jobs_deleted": len(job_ids),
+        "vectors_removed": vectors_before - get_pdf_chunk_count(pdf_name),
+        "total_vectors": total_vectors(),
+        "errors": errors,
+    }
 
 
 def sync_storage_and_index():
@@ -167,13 +229,42 @@ def serve_pdf(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
 
-@app.route("/delete/<pdf_name>", methods=["POST"])
+@app.route("/delete/<pdf_name>", methods=["DELETE", "POST"])
 def delete_pdf_route(pdf_name):
+    """Delete a PDF end-to-end and return JSON (no redirect, no swallowing).
+
+    Runs synchronously and only reports success once every step finished.
+    HTTP status is meaningful:
+      200  fully deleted (body: status=ok, vectors_removed, total_vectors, ...)
+      404  PDF does not exist anywhere (idempotent re-delete)
+      500  deletion failed / partial (details in body["error"])
+    """
     try:
-        delete_pdf(pdf_name)
-    except Exception as e:
-        logger.error("[Delete] Error deleting %s: %s", pdf_name, e)
-    return redirect(url_for("home"))
+        summary = delete_pdf(pdf_name)
+    except DeleteNotFound as exc:
+        logger.info("[Delete] %s", exc)
+        return jsonify({"status": "not_found", "deleted": False,
+                        "error": str(exc)}), 404
+    except DeleteFailed as exc:
+        logger.error("[Delete] %s", exc)
+        return jsonify({"status": "error", "deleted": False,
+                        "error": str(exc)}), 500
+    except Exception as exc:
+        logger.error("[Delete] Unexpected error deleting %s: %s",
+                     pdf_name, exc, exc_info=True)
+        return jsonify({"status": "error", "deleted": False,
+                        "error": str(exc)}), 500
+
+    if summary["errors"]:
+        logger.error("[Delete] Partial deletion of %s: %s",
+                     pdf_name, "; ".join(summary["errors"]))
+        return jsonify({"status": "partial", **summary,
+                        "error": "; ".join(summary["errors"])}), 500
+
+    logger.info("[Delete] Deleted %s (jobs=%d, vectors=%d, total_vectors=%d)",
+                pdf_name, summary["jobs_deleted"], summary["vectors_removed"],
+                summary["total_vectors"])
+    return jsonify({"status": "ok", **summary}), 200
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -215,6 +306,53 @@ def home():
         uploaded_pdfs=get_uploaded_pdfs(),
         total_vectors=total_vectors(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Health checks
+# ---------------------------------------------------------------------------
+
+
+@app.route("/health")
+def health():
+    """Liveness + dependency health check.
+
+    Returns 200 when the app, database backend and RabbitMQ broker are all
+    reachable; 503 otherwise.  ``celery_workers`` reports how many workers
+    answered the ping (informational — 0 is allowed, e.g. during deploy).
+    """
+    checks = {
+        "status": "ok",
+        "app": "ok",
+        "database": "ok",
+        "broker": "ok",
+        "celery_workers": 0,
+    }
+    status_code = 200
+
+    try:
+        get_all_jobs()
+    except Exception as exc:
+        checks["database"] = f"error: {exc}"
+        checks["status"] = "error"
+        status_code = 503
+
+    try:
+        from celery_app import celery_app
+
+        with celery_app.connection() as conn:
+            conn.ensure_connection(max_retries=1, timeout=2)
+        try:
+            workers = celery_app.control.ping(timeout=2)
+            checks["celery_workers"] = len(workers)
+        except Exception as exc:
+            logger.warning("[Health] worker ping failed: %s", exc)
+    except Exception as exc:
+        checks["broker"] = f"error: {exc}"
+        checks["status"] = "error"
+        status_code = 503
+
+    return jsonify(checks), status_code
 
 
 # ---------------------------------------------------------------------------
@@ -363,27 +501,27 @@ def debug_metadata():
 
 
 
-def start_background_tasks():
-    """Start resume, retry, and the background worker.
+def start_reconciliation():
+    """Re-enqueue any jobs left unfinished by a previous run (crash recovery).
 
-    Safe to call multiple times — the underlying components are idempotent
-    (BackgroundWorker.start() has its own guard, and the resume / retry
-    functions use _ACTIVE_JOBS to prevent double-processing).
+    Runs once at startup.  Idempotent — the atomic job claim in the Celery
+    orchestrator prevents duplicates.  If RabbitMQ is down, jobs stay
+    non-terminal in the DB and are picked up on the next restart.
     """
-    logger.info("[Startup] Starting background tasks ...")
-    threading.Thread(target=resume_processing, daemon=True).start()
-    threading.Thread(target=retry_failed_jobs, daemon=True).start()
-    background_worker.start()
-    logger.info("[Startup] Background tasks launched")
-
-
+    logger.info("[Startup] Starting queue reconciliation ...")
+    try:
+        n = resume_pending_jobs()
+        logger.info("[Startup] Reconciliation done: %d job(s) re-enqueued", n)
+    except Exception as exc:
+        logger.error("[Startup] Reconciliation failed: %s", exc, exc_info=True)
+    logger.info("[Startup] Reconciliation finished")
 
 
 _is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
 _is_reloader_parent = not _is_reloader_child and os.environ.get("WERKZEUG_SERVER_FD")
 
 if _is_reloader_child or not _is_reloader_parent:
-    start_background_tasks()
+    start_reconciliation()
 
 if __name__ == "__main__":
     app.run(debug=True)

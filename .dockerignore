@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+uploads/
+database/faiss.index
+database/faiss.index.tmp
+database/metadata.pkl
+database/metadata.pkl.tmp
+database/processing_jobs.json
+database/processing_jobs.json.tmp
+database/chunks/
+database/*.lock
