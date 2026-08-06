@@ -331,6 +331,10 @@ def index_chunks(self, job_id):
     of vectors already in FAISS for this PDF must match the checkpoint.  Any
     mismatch (crash mid-index, redelivered batch, stale partial state) clears
     the PDF's vectors and restarts indexing from zero.
+
+    The job is re-checked before every batch: if the PDF was deleted while
+    this stage was running, the job row is already gone and further batches
+    must NOT be added, otherwise the delete's FAISS removal would be undone.
     """
     job = _job_alive(job_id)
     if job is None:
@@ -368,10 +372,28 @@ def index_chunks(self, job_id):
                             job_id, start)
                 continue
 
+            # Stop if the job disappeared mid-indexing (e.g. the PDF was
+            # deleted while this stage was running).  The delete pipeline
+            # removes the processing_jobs row before touching FAISS, so a
+            # missing job here means its vectors must not be re-added.
+            if _job_alive(job_id) is None:
+                logger.info("[%s] index: job deleted during indexing — "
+                            "aborting before batch %d", job_id, start)
+                return job_id
+
             batch = chunks[start: start + len(vectors)]
             update_job_status(job_id, current_stage="INDEXING",
                               last_processed_chunk=start)
-            add_documents(batch, vectors)
+            # Guard re-checks job aliveness *inside* the FAISS file lock, so
+            # a delete that already removed this job's processing_jobs row
+            # (before taking the same lock) cannot have its vectors re-added.
+            added = add_documents(
+                batch, vectors, guard=lambda: _job_alive(job_id) is not None
+            )
+            if added == 0:
+                logger.info("[%s] index: job deleted during indexing — "
+                            "aborted before batch %d", job_id, start)
+                return job_id
 
             processed_up_to = start + len(batch)
             save_checkpoint(job_id, processed_up_to,
@@ -432,6 +454,7 @@ def finalize(self, job_id):
         job_id,
         status="COMPLETED",
         current_stage="COMPLETED",
+        total_chunks=total,
         last_processed_chunk=total,
         error_message=None,
     )

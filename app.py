@@ -2,6 +2,8 @@
 
 import logging
 import os
+import threading
+import time
 
 from dotenv import load_dotenv
 from flask import (
@@ -18,6 +20,7 @@ from utils.supabase_storage import list_files, delete_file
 from utils.embeddings import create_query_embedding
 from utils.faiss_db import (
     get_pdf_chunk_count,
+    persisted_chunk_count,
     remove_pdf,
     search,
     sync_with_files,
@@ -25,7 +28,11 @@ from utils.faiss_db import (
 )
 from utils.gemini import GeminiGenerationError, generate_answer
 from utils.database import get_job, get_all_jobs, delete_jobs_for_pdf
-from utils.processing import start_processing, resume_pending_jobs
+from utils.processing import (
+    start_processing,
+    resume_pending_jobs,
+    resume_stuck_uploads,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -74,36 +81,50 @@ def is_allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() == "pdf"
 
 
+def _latest_job_for(all_jobs, pdf_name):
+    jobs = [j for j in all_jobs if j.get("pdf_name") == pdf_name]
+    return max(jobs, key=lambda j: j.get("created_at", "")) if jobs else None
+
+
+def _status_from_job(job, pdf_name):
+    if job is None:
+        return "indexed" if get_pdf_chunk_count(pdf_name) > 0 else "processing"
+    s = job["status"]
+    if s == "COMPLETED":
+        return "indexed"
+    elif s == "FAILED":
+        return "failed"
+    return "processing"
+
+
 def _get_status_for_pdf(pdf_name):
     all_jobs = get_all_jobs()
-    pdf_jobs = [j for j in all_jobs if j["pdf_name"] == pdf_name]
-
-    if pdf_jobs:
-        latest = max(pdf_jobs, key=lambda j: j["created_at"])
-        s = latest["status"]
-        if s == "COMPLETED":
-            return "indexed"
-        elif s == "FAILED":
-            return "failed"
-        return "processing"
-
-    if get_pdf_chunk_count(pdf_name) > 0:
-        return "indexed"
-    return "processing"
+    return _status_from_job(_latest_job_for(all_jobs, pdf_name), pdf_name)
 
 
 def get_uploaded_pdfs():
     files = list_files()
+    all_jobs = get_all_jobs()
+
     pdfs = []
     for f in files:
         name = f.get("name", "")
         if not name.lower().endswith(".pdf"):
             continue
+        job = _latest_job_for(all_jobs, name)
+
+        # Authoritative chunk count: a COMPLETED job's total_chunks is what
+        # the pipeline actually indexed.  Fall back to the FAISS index (live
+        # progress, or indexed PDFs without a job row) when not completed.
+        chunks = get_pdf_chunk_count(name)
+        if job is not None and job["status"] == "COMPLETED" and job.get("total_chunks"):
+            chunks = job["total_chunks"]
+
         pdfs.append({
             "name": name,
             "created_at": f.get("created_at", ""),
-            "status": _get_status_for_pdf(name),
-            "chunks": get_pdf_chunk_count(name),
+            "status": _status_from_job(job, name),
+            "chunks": chunks,
         })
     pdfs.sort(key=lambda p: p["created_at"], reverse=True)
     return pdfs
@@ -124,9 +145,20 @@ def delete_pdf(pdf_name):
       1. Supabase Storage (source of truth) — on failure nothing has changed
          yet, so the delete aborts cleanly with a meaningful error.
       2. processing_jobs rows — removed BEFORE the index so an in-flight
-         Celery stage finds no job and stops instead of re-adding vectors.
-      3. FAISS vectors + metadata (persists faiss.index + metadata.pkl).
+         Celery stage finds no job and stops instead of re-adding vectors
+         (tasks.py also re-checks job aliveness inside its indexing loop).
+      3. FAISS vectors + metadata — the index is reconciled against the
+         remaining Supabase files (persists faiss.index + metadata.pkl).
+         The reconciliation removes the deleted PDF's vectors *and* any other
+         orphaned vectors (e.g. a re-upload that changed the object name, or
+         a stale entry from an earlier partial delete).  When the last PDF is
+         deleted this leaves an empty index + empty metadata.
       4. Local download-cache copy.
+
+    The FAISS reconciliation only runs when the storage listing was proven
+    usable (the file existed and was deleted from Supabase).  ``list_files()``
+    returns ``[]`` on a Supabase error, so without that guard a transient
+    outage could wrongly empty the whole index.
 
     Returns a summary dict.  Failures in the non-critical steps 2-4 are
     logged with the exact error and collected in summary["errors"] so the
@@ -134,7 +166,7 @@ def delete_pdf(pdf_name):
     """
     storage_names = {f.get("name", "") for f in list_files()}
     storage_exists = pdf_name in storage_names
-    vectors_before = get_pdf_chunk_count(pdf_name)
+    vectors_before = total_vectors()
     job_ids = [j["job_id"] for j in get_all_jobs()
                if j["pdf_name"] == pdf_name]
 
@@ -164,7 +196,34 @@ def delete_pdf(pdf_name):
         errors.append(f"processing_jobs: {exc}")
 
     try:
-        remove_pdf(pdf_name)
+        if storage_exists:
+            # The storage listing we captured was proven correct (the file
+            # existed and was deleted), so it is safe to use it as the
+            # source of truth for what must remain in the index.
+            remaining_pdfs = sorted(
+                name for name in storage_names
+                if name != pdf_name and name.lower().endswith(".pdf")
+            )
+            orphaned = sync_with_files(remaining_pdfs)
+            if orphaned:
+                logger.info("[Delete] Reconcile removed %d orphaned PDF(s): %s",
+                            len(orphaned), orphaned)
+        else:
+            # Storage state is not positively confirmed (the listing may have
+            # failed); remove only by exact name so a bogus empty listing can
+            # never wipe unrelated vectors.
+            remove_pdf(pdf_name)
+
+        # Prove the removal actually persisted to disk.  A failed os.replace
+        # (Windows file-lock contention) used to leave the PDF's chunks in
+        # metadata.pkl while the route still reported success — this check
+        # makes that a loud failure instead of a silent one.
+        remaining_chunks = persisted_chunk_count(pdf_name)
+        if remaining_chunks > 0:
+            raise RuntimeError(
+                f"'{pdf_name}' still has {remaining_chunks} chunks persisted "
+                f"after FAISS removal"
+            )
     except Exception as exc:
         logger.error("[Delete] FAISS removal failed for %s: %s",
                      pdf_name, exc, exc_info=True)
@@ -179,13 +238,14 @@ def delete_pdf(pdf_name):
                      pdf_name, exc, exc_info=True)
         errors.append(f"local_file: {exc}")
 
+    vectors_after = total_vectors()
     return {
         "pdf_name": pdf_name,
         "deleted": True,
         "storage_deleted": storage_exists,
         "jobs_deleted": len(job_ids),
-        "vectors_removed": vectors_before - get_pdf_chunk_count(pdf_name),
-        "total_vectors": total_vectors(),
+        "vectors_removed": vectors_before - vectors_after,
+        "total_vectors": vectors_after,
         "errors": errors,
     }
 
@@ -266,13 +326,10 @@ def delete_pdf_route(pdf_name):
                 summary["total_vectors"])
     return jsonify({"status": "ok", **summary}), 200
 
+#post# 
 
 @app.route("/", methods=["GET", "POST"])
 def home():
-    results = []
-    answer = None
-    query = ""
-
     if request.method == "POST":
         if "pdf" in request.files:
             pdf = request.files["pdf"]
@@ -286,17 +343,28 @@ def home():
         if "query" in request.form:
             query = request.form["query"].strip()
             if query:
-                try:
-                    query_embedding = create_query_embedding(query)
-                    results = search(query_embedding, top_k=1)
-                    if results:
-                        contexts = [r["text"] for r in results]
-                        try:
-                            answer = generate_answer(query, contexts)
-                        except GeminiGenerationError:
-                            answer = contexts[0][:300]
-                except Exception as e:
-                    logger.error("[Search] Error: %s", e)
+                return redirect(url_for("home", q=query), 303)
+        return redirect(url_for("home"))
+
+    query = request.args.get("q", "").strip()
+    results = []
+    answer = None
+
+    if query:
+        try:
+            if total_vectors() == 0:
+                answer = "No documents indexed."
+            else:
+                query_embedding = create_query_embedding(query)
+                results = search(query_embedding, top_k=1)
+                if results:
+                    contexts = [r["text"] for r in results]
+                    try:
+                        answer = generate_answer(query, contexts)
+                    except GeminiGenerationError:
+                        answer = contexts[0][:300]
+        except Exception as e:
+            logger.error("[Search] Error: %s", e)
 
     return render_template(
         "index.html",
@@ -517,11 +585,45 @@ def start_reconciliation():
     logger.info("[Startup] Reconciliation finished")
 
 
+STUCK_UPLOAD_RECONCILE_INTERVAL = 15
+
+
+def _stuck_upload_reconciler_loop():
+    """Periodically re-enqueue jobs stuck in UPLOADED (publish failed).
+
+    Runs in a daemon thread so an upload whose RabbitMQ publish failed (see
+    ``utils.processing.enqueue_job``) is automatically retried instead of
+    showing "Processing / 0 Chunks" forever.  Only UPLOADED jobs are touched,
+    and each is claimed atomically before publishing, so a backed-up queue can
+    never cause a duplicate.
+    """
+    logger.info("[Startup] Stuck-upload reconciler thread started "
+                "(interval=%ds)", STUCK_UPLOAD_RECONCILE_INTERVAL)
+    while True:
+        try:
+            n = resume_stuck_uploads()
+            if n:
+                logger.info("[Startup] Stuck-upload pass re-enqueued %d job(s)", n)
+        except Exception as exc:
+            logger.error("[Startup] Stuck-upload reconciliation failed: %s",
+                         exc, exc_info=True)
+        time.sleep(STUCK_UPLOAD_RECONCILE_INTERVAL)
+
+
+def start_stuck_upload_reconciler():
+    threading.Thread(
+        target=_stuck_upload_reconciler_loop,
+        name="stuck-upload-reconciler",
+        daemon=True,
+    ).start()
+
+
 _is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
 _is_reloader_parent = not _is_reloader_child and os.environ.get("WERKZEUG_SERVER_FD")
 
 if _is_reloader_child or not _is_reloader_parent:
     start_reconciliation()
+    start_stuck_upload_reconciler()
 
 if __name__ == "__main__":
     app.run(debug=True)

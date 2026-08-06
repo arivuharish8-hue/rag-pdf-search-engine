@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -115,7 +115,7 @@ def create_job(pdf_name, storage_path):
     logger.info("[DB] Job %s created for %s", job_id, pdf_name)
     return job_id
 
-
+#patch# 
 def update_job_status(job_id, **kwargs):
     """Update one or more fields on an existing job."""
     allowed = {"status", "current_stage", "total_chunks",
@@ -177,6 +177,76 @@ def try_claim_job(job_id):
         job["updated_at"] = _now()
         _write_json(data)
         return True
+
+
+def claim_upload(job_id):
+    """Atomically move a job from UPLOADED to PROCESSING. Returns True if this
+    caller won the transition.
+
+    Stricter than ``try_claim_job``: it only succeeds on the UPLOADED →
+    PROCESSING transition, so at most one publisher (the upload request or a
+    stuck-job reconciler) ever enqueues a given job.  A job that is already
+    PROCESSING belongs to a worker (or a message already in the queue) and is
+    never touched here.
+    """
+    if _detect_backend():
+        result = (
+            _SUPABASE_TABLE.update({"status": "PROCESSING",
+                                    "current_stage": "PROCESSING"})
+            .eq("job_id", job_id)
+            .eq("status", "UPLOADED")
+            .execute()
+        )
+        return bool(result.data)
+    with _JSON_LOCK:
+        data = _read_json()
+        job = data.get(job_id)
+        if job is None or job["status"] != "UPLOADED":
+            return False
+        job["status"] = "PROCESSING"
+        job["current_stage"] = "PROCESSING"
+        job["updated_at"] = _now()
+        _write_json(data)
+        return True
+
+
+def release_upload(job_id):
+    """Revert a job claimed via ``claim_upload`` back to UPLOADED.
+
+    Used when the RabbitMQ publish fails after the claim, so the job stays
+    non-terminal and the stuck-job reconciler can retry it later.
+    """
+    update_job_status(job_id, status="UPLOADED", current_stage="UPLOADED")
+
+
+def get_stuck_uploads(min_age_seconds=15):
+    """Return jobs that were created but never claimed, oldest first.
+
+    A job sits in UPLOADED only until a worker (or the upload request) claims
+    it.  If it is still UPLOADED long after creation the RabbitMQ publish
+    must have failed, so it is safe for a reconciler to re-enqueue it.  The
+    age threshold keeps the reconciler from racing a freshly-created job.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=min_age_seconds)).isoformat()
+    if _detect_backend():
+        result = (
+            _SUPABASE_TABLE.select("*")
+            .eq("status", "UPLOADED")
+            .lt("created_at", cutoff)
+            .order("created_at")
+            .execute()
+        )
+        jobs = result.data or []
+    else:
+        with _JSON_LOCK:
+            data = _read_json()
+        jobs = [j for j in data.values()
+                if j.get("status") == "UPLOADED"
+                and (j.get("created_at", "") or "") < cutoff]
+        jobs.sort(key=lambda j: j["created_at"])
+
+    logger.debug("[DB] get_stuck_uploads: %d job(s)", len(jobs))
+    return jobs
 
 
 def get_pending_jobs():

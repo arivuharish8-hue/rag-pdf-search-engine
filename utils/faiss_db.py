@@ -20,6 +20,7 @@ import logging
 import os
 import pickle
 import threading
+import time
 
 import faiss
 import numpy as np
@@ -27,6 +28,17 @@ import numpy as np
 from utils.file_lock import FileLock
 
 logger = logging.getLogger(__name__)
+
+# Number of times to retry an ``os.replace`` when the target file is briefly
+# open by another process (Windows raises PermissionError in that case).
+ATOMIC_REPLACE_RETRIES = int(os.getenv("FAISS_REPLACE_RETRIES", "10"))
+
+# Verified-removal polling: after removing a PDF we release the file lock and
+# re-check the persisted files, because a Celery worker that was mid-batch can
+# re-add one batch after our save.  These constants bound how long we wait and
+# re-remove before declaring the deletion successful.
+REMOVE_VERIFY_RETRIES = int(os.getenv("FAISS_REMOVE_VERIFY_RETRIES", "5"))
+REMOVE_VERIFY_DELAY = float(os.getenv("FAISS_REMOVE_VERIFY_DELAY", "0.6"))
 
 DATABASE_DIR = "database"
 INDEX_FILE = os.path.join(DATABASE_DIR, "faiss.index")
@@ -71,6 +83,28 @@ def _load():
         _LOADED_AT = 0.0
 
 
+def _atomic_replace(src, dst):
+    """``os.replace`` that survives transient Windows file-lock contention.
+
+    On Windows ``os.replace`` fails with ``PermissionError`` if another
+    process has ``dst`` open at that instant (e.g. a Celery worker calling
+    ``total_vectors()``/``search()``, which open the index file via
+    ``os.path.getmtime`` / ``faiss.read_index``).  A stale ``os.replace``
+    failure is fatal for a delete: ``faiss.index``/``metadata.pkl`` would
+    simply not be rewritten.  Retrying closes that window.
+    """
+    for attempt in range(1, ATOMIC_REPLACE_RETRIES + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == ATOMIC_REPLACE_RETRIES:
+                raise
+            logger.debug("[FAISS] os.replace(%s) blocked by an open handle — "
+                         "retry %d/%d", dst, attempt, ATOMIC_REPLACE_RETRIES)
+            time.sleep(0.05 * attempt)
+
+
 def _save():
     """Persist index + metadata atomically.
 
@@ -83,12 +117,12 @@ def _save():
 
     tmp_index = INDEX_FILE + ".tmp"
     faiss.write_index(index, tmp_index)
-    os.replace(tmp_index, INDEX_FILE)
+    _atomic_replace(tmp_index, INDEX_FILE)
 
     tmp_meta = METADATA_FILE + ".tmp"
     with open(tmp_meta, "wb") as f:
         pickle.dump(metadata, f)
-    os.replace(tmp_meta, METADATA_FILE)
+    _atomic_replace(tmp_meta, METADATA_FILE)
 
     _LOADED_AT = os.path.getmtime(INDEX_FILE)
 
@@ -103,6 +137,12 @@ def _maybe_reload():
     try:
         mtime = os.path.getmtime(INDEX_FILE)
     except OSError:
+        # faiss.index no longer exists on disk — the authoritative on-disk
+        # state is empty.  Reload (→ empty) instead of serving the stale
+        # in-memory index forever: a delete that emptied the database would
+        # otherwise keep reporting phantom vectors and old search hits.
+        with FileLock(LOCK_FILE):
+            _load()
         return
     if mtime > _LOADED_AT:
         with FileLock(LOCK_FILE):
@@ -115,6 +155,8 @@ def _maybe_reload_under_lock():
     try:
         mtime = os.path.getmtime(INDEX_FILE)
     except OSError:
+        # See _maybe_reload: a missing index file means empty on disk.
+        _load()
         return
     if mtime > _LOADED_AT:
         _load()
@@ -131,38 +173,53 @@ def _prepare_for_write():
 def _remove_pdf_unlocked(pdf_name):
     """Remove one PDF's vectors + metadata. Caller holds both locks.
 
-    The surviving vectors are copied from the existing index with
-    ``reconstruct_n`` (no re-embedding), so removal keeps the exact stored
-    embeddings, preserves index/metadata order, and runs in seconds even for
-    large corpora.  Persists faiss.index + metadata.pkl atomically via
-    ``_save()``.
+    Operates on a FRESH read of the persisted state (``_load()``) rather than
+    a worker's possibly-stale in-memory copy, so the removal is authoritative
+    even with multiple gunicorn/Celery processes — a stale worker would
+    otherwise compute ``removed == 0`` and never persist anything.
+
+    When the index and metadata counts match 1:1, the surviving vectors are
+    copied from the existing index with ``reconstruct_n`` (no re-embedding).
+    When they do NOT match (stale / corrupt state where individual removal
+    cannot be trusted), the whole index is rebuilt from the remaining
+    metadata instead.  Both paths persist faiss.index + metadata.pkl
+    atomically.
+
+    Returns the number of metadata entries removed (0 when the PDF had no
+    indexed chunks — callers should not treat that as a failure by itself).
     """
     global index, metadata
+    _load()  # authoritative on-disk state — never remove against stale memory
     before = len(metadata)
     keep_positions = [i for i, m in enumerate(metadata)
                       if m["pdf_name"] != pdf_name]
     removed = before - len(keep_positions)
 
     if not removed:
-        logger.debug("[FAISS] remove_pdf: %s not found", pdf_name)
-        return
+        logger.debug("[FAISS] remove_pdf: %s not found in persisted state",
+                     pdf_name)
+        return 0
 
-    new_index = faiss.IndexFlatIP(DIMENSION)
-    if index is not None and index.ntotal > 0:
-        n = min(index.ntotal, before)
-        positions = [i for i in keep_positions if i < n]
-        if positions:
-            vectors = index.reconstruct_n(0, n)[positions]
-            new_index.add(np.ascontiguousarray(vectors, dtype=np.float32))
-
-    index = new_index
     keep_set = set(keep_positions)
-    metadata = [m for i, m in enumerate(metadata) if i in keep_set]
-    _save()
+    if index is not None and index.ntotal == before:
+        new_index = faiss.IndexFlatIP(DIMENSION)
+        if index.ntotal > 0:
+            positions = [i for i in keep_positions if i < index.ntotal]
+            if positions:
+                vectors = index.reconstruct_n(0, index.ntotal)[positions]
+                new_index.add(np.ascontiguousarray(vectors, dtype=np.float32))
+        index = new_index
+        metadata = [m for i, m in enumerate(metadata) if i in keep_set]
+        _save()
+    else:
+        metadata = [m for i, m in enumerate(metadata) if i in keep_set]
+        _rebuild_from_metadata()
+
     logger.info(
         "[FAISS] remove_pdf: %s — removed %d entries, %d vectors remain",
         pdf_name, removed, index.ntotal,
     )
+    return removed
 
 
 def _rebuild_from_metadata():
@@ -194,11 +251,27 @@ def _rebuild_from_metadata():
 # ---------------------------------------------------------------------------
 
 
-def add_documents(chunks, embeddings):
+def add_documents(chunks, embeddings, guard=None):
+    """Add chunk embeddings + metadata, optionally gated by ``guard``.
+
+    ``guard`` is a zero-arg callable evaluated *while holding both locks*,
+    right before the write.  A Celery worker uses it to re-check job
+    aliveness so a PDF deleted concurrently cannot have its vectors
+    re-introduced after the delete's FAISS removal (delete removes the
+    processing_jobs row *before* acquiring the FAISS locks, so the guard and
+    the removal serialize on the file lock).
+
+    Returns the number of chunks added (0 when ``guard`` aborted the write).
+    """
     global index, metadata
     with _FAISS_LOCK:
         with FileLock(LOCK_FILE):
             _prepare_for_write()
+
+            if guard is not None and not guard():
+                logger.info("[FAISS] add_documents aborted by guard "
+                            "(no vectors written)")
+                return 0
 
             n_before = index.ntotal
             embeddings = np.asarray(embeddings, dtype=np.float32)
@@ -207,13 +280,83 @@ def add_documents(chunks, embeddings):
             _save()
             logger.info("[FAISS] add_documents: %d → %d vectors (+%d)",
                         n_before, index.ntotal, len(chunks))
+            return len(chunks)
+
+
+def _persisted_chunks_for(pdf_name):
+    """Count a PDF's chunks by reading metadata.pkl straight from disk."""
+    if not os.path.exists(METADATA_FILE):
+        return 0
+    try:
+        with open(METADATA_FILE, "rb") as f:
+            persisted = pickle.load(f)
+    except Exception:
+        logger.error("[FAISS] metadata.pkl unreadable — cannot verify removal")
+        return -1
+    return sum(1 for m in persisted if m["pdf_name"] == pdf_name)
+
+
+def _verify_persisted_clean(pdf_name):
+    """Poll metadata.pkl over a bounded window, re-removing late re-adds.
+
+    A Celery worker that passed ``_job_alive()`` before a delete can still be
+    mid-batch: after our save it re-adds one batch of this PDF via
+    ``add_documents``.  Release the lock and poll the persisted files across
+    the FULL window (even when the first poll is clean) so a batch that lands
+    shortly after our write is caught and re-removed.  Caller holds
+    ``_FAISS_LOCK``.
+    """
+    for attempt in range(1, REMOVE_VERIFY_RETRIES + 1):
+        time.sleep(REMOVE_VERIFY_DELAY)
+        with FileLock(LOCK_FILE):
+            _load()  # fresh from disk (worker may have re-added)
+            if sum(1 for m in metadata if m["pdf_name"] == pdf_name):
+                logger.warning(
+                    "[FAISS] remove_pdf: %s re-appeared (late worker batch) — "
+                    "re-removing (verify %d/%d)",
+                    pdf_name, attempt, REMOVE_VERIFY_RETRIES,
+                )
+                _remove_pdf_unlocked(pdf_name)
+
+    present = _persisted_chunks_for(pdf_name)
+    if present > 0:
+        logger.error(
+            "[FAISS] remove_pdf: %s still has %d persisted chunks after %d "
+            "verify passes — deletion did NOT persist reliably",
+            pdf_name, present, REMOVE_VERIFY_RETRIES,
+        )
+    return present
+
+
+def persisted_chunk_count(pdf_name):
+    """Number of a PDF's chunks that are still on disk (direct metadata.pkl read).
+
+    Used after a delete to prove the removal actually persisted, independent of
+    the in-memory copy.
+    """
+    return _persisted_chunks_for(pdf_name)
 
 
 def remove_pdf(pdf_name):
+    """Remove one PDF's vectors + metadata from disk.
+
+    Re-checks the persisted files after removal and re-removes anything a
+    mid-batch worker re-added, so the delete is actually durable — not just
+    applied to the in-memory copy.
+
+    Returns the number of metadata entries removed (0 if ``pdf_name`` has no
+    indexed chunks).
+    """
     with _FAISS_LOCK:
         with FileLock(LOCK_FILE):
             _prepare_for_write()
-            _remove_pdf_unlocked(pdf_name)
+            removed = _remove_pdf_unlocked(pdf_name)
+
+        # Always run the verification window: a late worker batch can re-add
+        # chunks even when the in-memory removal found nothing (it may have
+        # landed between our _prepare_for_write and this call).
+        _verify_persisted_clean(pdf_name)
+        return removed
 
 
 def rebuild_index():
@@ -298,7 +441,12 @@ def get_indexed_pdfs():
 
 
 def sync_with_files(existing_files):
-    """Remove FAISS entries for PDFs no longer in existing_files list."""
+    """Remove FAISS entries for PDFs no longer in existing_files list.
+
+    Uses verified removal per PDF so a mid-batch worker cannot re-introduce
+    the deleted vectors after the persisted write.
+    """
+    orphaned = []
     with _FAISS_LOCK:
         with FileLock(LOCK_FILE):
             _prepare_for_write()
@@ -311,7 +459,10 @@ def sync_with_files(existing_files):
                 logger.info("[FAISS] Removing orphaned PDF: %s", pdf_name)
                 _remove_pdf_unlocked(pdf_name)
 
-            return orphaned
+    for pdf_name in orphaned:
+        _verify_persisted_clean(pdf_name)
+
+    return orphaned
 
 
 def save_all():

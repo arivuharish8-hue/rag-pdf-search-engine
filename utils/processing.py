@@ -13,11 +13,15 @@ metadata + status updates) runs in Celery workers.  See ``tasks.py``.
 
 import logging
 import os
+import time
 
 from utils.database import (
+    claim_upload,
     create_job,
     get_failed_jobs,
     get_pending_jobs,
+    get_stuck_uploads,
+    release_upload,
     update_job_status,
 )
 from utils.supabase_storage import upload_file
@@ -25,6 +29,9 @@ from utils.supabase_storage import upload_file
 logger = logging.getLogger(__name__)
 
 UPLOAD_FOLDER = "uploads"
+
+ENQUEUE_RETRIES = int(os.getenv("ENQUEUE_RETRIES", "3"))
+ENQUEUE_RETRY_DELAY_SECONDS = 1
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +42,11 @@ UPLOAD_FOLDER = "uploads"
 def start_processing(pdf_file, filename):
     """Save PDF locally, upload to Supabase Storage, create a DB job and
     enqueue it on RabbitMQ.
+
+    The job is atomically claimed (UPLOADED → PROCESSING) before the publish
+    so that only one publisher ever enqueues it and a backed-up queue can
+    never cause a duplicate.  If the publish fails the claim is reverted and
+    the job stays UPLOADED so the stuck-job reconciler retries it.
 
     Returns (object_name, job_id).  Returns immediately — the actual
     extraction / embedding / indexing happens in a Celery worker.
@@ -51,7 +63,17 @@ def start_processing(pdf_file, filename):
     pdf_file.save(local_path)
     upload_file(local_path, object_name)
     job_id = create_job(object_name, object_name)
-    enqueue_job(job_id)
+    if not claim_upload(job_id):
+        logger.warning("[Processing] Job %s already claimed elsewhere", job_id)
+        return object_name, job_id
+
+    try:
+        enqueue_job(job_id)
+    except Exception:
+        release_upload(job_id)
+        logger.error("[Processing] Job %s created but not enqueued — it will "
+                     "be picked up by the stuck-job reconciler", job_id)
+        raise
 
     logger.info("[Processing] Job %s created for %s", job_id, object_name)
     return object_name, job_id
@@ -62,20 +84,32 @@ def start_processing(pdf_file, filename):
 # ---------------------------------------------------------------------------
 
 
-def enqueue_job(job_id):
+def enqueue_job(job_id, max_retries=None, retry_delay=None):
     """Publish job_id to RabbitMQ for processing.
 
-    Import of tasks is lazy to avoid a Celery/Flask import cycle.  If the
-    broker is temporarily unreachable the upload still succeeds — the job is
-    non-terminal in the DB, so ``resume_pending_jobs()`` re-enqueues it later.
+    Retries a few times with a short backoff so a transient broker blip does
+    not wedge the job.  Raises the last exception once retries are exhausted
+    so callers can react (the job stays non-terminal in the DB and is retried
+    by ``resume_stuck_uploads()``).
+
+    Import of tasks is lazy to avoid a Celery/Flask import cycle.
     """
     from tasks import process_pdf_job
 
-    try:
-        process_pdf_job.delay(job_id)
-        logger.info("[Queue] job %s received and sent to RabbitMQ", job_id)
-    except Exception as exc:
-        logger.error("[Queue] failed to enqueue job %s: %s", job_id, exc)
+    max_retries = ENQUEUE_RETRIES if max_retries is None else max_retries
+    retry_delay = ENQUEUE_RETRY_DELAY_SECONDS if retry_delay is None else retry_delay
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            process_pdf_job.delay(job_id)
+            logger.info("[Queue] job %s received and sent to RabbitMQ", job_id)
+            return
+        except Exception as exc:
+            logger.warning("[Queue] enqueue attempt %d/%d failed for job %s: %s",
+                           attempt, max_retries, job_id, exc)
+            if attempt < max_retries:
+                time.sleep(retry_delay)
+    raise
 
 
 def resume_pending_jobs():
@@ -96,8 +130,41 @@ def resume_pending_jobs():
         logger.info("[Processing]   %s: %s (stage=%s, checkpoint=%d)",
                     jid, job["pdf_name"], job["current_stage"],
                     job["last_processed_chunk"])
-        enqueue_job(jid)
+        try:
+            enqueue_job(jid)
+        except Exception as exc:
+            logger.error("[Processing]   %s: re-enqueue failed: %s", jid, exc)
     return len(pending)
+
+
+def resume_stuck_uploads():
+    """Re-enqueue jobs that were created but never claimed.
+
+    A job stuck in UPLOADED means the original RabbitMQ publish failed (see
+    ``enqueue_job``).  Each job is claimed atomically (UPLOADED → PROCESSING)
+    before publishing, so at most one reconciler/worker enqueues it; if the
+    publish fails again the claim is reverted and the next pass retries.
+    Called periodically by the Flask reconciler thread.
+    """
+    stuck = get_stuck_uploads()
+    if not stuck:
+        logger.debug("[Processing] No stuck uploads to resume")
+        return 0
+
+    logger.info("[Processing] Resuming %d stuck upload(s) ...", len(stuck))
+    n = 0
+    for job in stuck:
+        jid = job["job_id"]
+        if not claim_upload(jid):
+            continue
+        try:
+            enqueue_job(jid)
+            n += 1
+            logger.info("[Processing]   %s: re-enqueued %s", jid, job["pdf_name"])
+        except Exception as exc:
+            release_upload(jid)
+            logger.error("[Processing]   %s: re-enqueue failed: %s", jid, exc)
+    return n
 
 
 def retry_failed_jobs():
@@ -118,6 +185,9 @@ def retry_failed_jobs():
         jid = job["job_id"]
         update_job_status(jid, status="UPLOADED", current_stage="UPLOADED",
                           error_message=None)
-        enqueue_job(jid)
-        logger.info("[Processing]   %s: %s", jid, job["pdf_name"])
+        try:
+            enqueue_job(jid)
+            logger.info("[Processing]   %s: %s", jid, job["pdf_name"])
+        except Exception as exc:
+            logger.error("[Processing]   %s: re-enqueue failed: %s", jid, exc)
     return len(failed)
