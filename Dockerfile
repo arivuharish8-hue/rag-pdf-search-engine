@@ -33,6 +33,9 @@ RUN useradd -ms /bin/bash appuser \
 # so worker startup never re-downloads (as root it used /root/.cache).
 USER appuser
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+# Pre-cache the second-stage reranker cross-encoder under the same HF cache so
+# the first search never blocks on a model download.
+RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
 
 EXPOSE 5000
 

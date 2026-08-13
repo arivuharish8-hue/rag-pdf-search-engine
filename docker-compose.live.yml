@@ -1,0 +1,5 @@
+# Pin the flask service to the fast-rebuilt overlay image (sim-flask:current).
+# Usage:  docker compose -f docker-compose.yml -f docker-compose.live.yml up -d
+services:
+  flask:
+    image: sim-flask:current

@@ -61,7 +61,17 @@ def start_processing(pdf_file, filename):
     local_path = os.path.join(UPLOAD_FOLDER, object_name)
 
     pdf_file.save(local_path)
-    upload_file(local_path, object_name)
+    try:
+        upload_file(local_path, object_name)
+    except Exception:
+        # A failed storage upload leaves an orphaned file in uploads/ that is
+        # not in Supabase, has no job row and is never indexed.  Remove the
+        # local artifact and surface the failure so it is not silent.
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        raise
     job_id = create_job(object_name, object_name)
     if not claim_upload(job_id):
         logger.warning("[Processing] Job %s already claimed elsewhere", job_id)

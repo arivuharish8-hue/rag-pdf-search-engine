@@ -1,0 +1,12 @@
+# Overlay used to fast-rebuild the app code layers on top of the already-built
+# sim-flask image.  requirements.txt is unchanged, so the heavy pip/CUDA layer
+# is reused verbatim; only app code from the current working tree is re-copied.
+FROM sim-flask
+USER root
+COPY . .
+RUN chown -R appuser:appuser /app
+USER appuser
+
+# Pre-cache the second-stage reranker model under the non-root user's HF cache
+# (same pattern as all-MiniLM-L6-v2 in the canonical Dockerfile).
+RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"

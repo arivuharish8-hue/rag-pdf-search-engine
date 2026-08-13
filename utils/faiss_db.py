@@ -25,6 +25,7 @@ import time
 import faiss
 import numpy as np
 
+from utils.bm25 import search as bm25_search, build as bm25_build
 from utils.file_lock import FileLock
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,12 @@ ATOMIC_REPLACE_RETRIES = int(os.getenv("FAISS_REPLACE_RETRIES", "10"))
 REMOVE_VERIFY_RETRIES = int(os.getenv("FAISS_REMOVE_VERIFY_RETRIES", "5"))
 REMOVE_VERIFY_DELAY = float(os.getenv("FAISS_REMOVE_VERIFY_DELAY", "0.6"))
 
+# Hybrid (FAISS + BM25) retrieval settings.
+FAISS_WEIGHT = float(os.getenv("FAISS_WEIGHT", "0.5"))
+BM25_WEIGHT = float(os.getenv("BM25_WEIGHT", "0.5"))
+FAISS_CANDIDATES = int(os.getenv("FAISS_CANDIDATES", "10"))
+BM25_CANDIDATES = int(os.getenv("BM25_CANDIDATES", "10"))
+
 DATABASE_DIR = "database"
 INDEX_FILE = os.path.join(DATABASE_DIR, "faiss.index")
 METADATA_FILE = os.path.join(DATABASE_DIR, "metadata.pkl")
@@ -53,6 +60,7 @@ index = None
 metadata = []
 _FAISS_LOCK = threading.RLock()
 _LOADED_AT = 0.0  # mtime of INDEX_FILE when index/metadata were last loaded
+_METADATA_VERSION = 0  # bumped on every metadata change; drives BM25 rebuilds
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +89,21 @@ def _load():
         _LOADED_AT = os.path.getmtime(INDEX_FILE)
     except OSError:
         _LOADED_AT = 0.0
+
+    _mark_metadata_changed()
+
+
+def _mark_metadata_changed():
+    """Bump the metadata version and rebuild the BM25 index from it.
+
+    Called whenever ``metadata`` is reloaded or mutated (still under the
+    FAISS / file locks held by the caller).  Keeping FAISS vectors, the
+    metadata list and the BM25 index on the same version means a deleted PDF
+    can never resurface through keyword search.
+    """
+    global _METADATA_VERSION
+    _METADATA_VERSION += 1
+    bm25_build(metadata, _METADATA_VERSION)
 
 
 def _atomic_replace(src, dst):
@@ -210,6 +233,7 @@ def _remove_pdf_unlocked(pdf_name):
                 new_index.add(np.ascontiguousarray(vectors, dtype=np.float32))
         index = new_index
         metadata = [m for i, m in enumerate(metadata) if i in keep_set]
+        _mark_metadata_changed()
         _save()
     else:
         metadata = [m for i, m in enumerate(metadata) if i in keep_set]
@@ -230,6 +254,7 @@ def _rebuild_from_metadata():
     if not metadata:
         _save()
         logger.info("[FAISS] Rebuilt empty index (no metadata)")
+        _mark_metadata_changed()
         return
 
     from utils.embeddings import create_embeddings
@@ -244,6 +269,7 @@ def _rebuild_from_metadata():
     _save()
     logger.info("[FAISS] Rebuilt index with %d vectors from %d chunks",
                 index.ntotal, len(metadata))
+    _mark_metadata_changed()
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +303,7 @@ def add_documents(chunks, embeddings, guard=None):
             embeddings = np.asarray(embeddings, dtype=np.float32)
             index.add(embeddings)
             metadata.extend(chunks)
+            _mark_metadata_changed()
             _save()
             logger.info("[FAISS] add_documents: %d → %d vectors (+%d)",
                         n_before, index.ntotal, len(chunks))
@@ -408,6 +435,149 @@ def search(query_embedding, top_k=3):
                 break
 
         return results
+
+
+def _faiss_candidates(query_embedding, top_k):
+    """FAISS semantic candidates as ``(raw_score, metadata_index)`` pairs.
+
+    Preserves the existing search semantics (IndexFlatIP dot product, the
+    0.40 similarity floor, dedupe by chunk key) but returns more candidates
+    than the final top-k so BM25-only hits are not starved out.
+    """
+    query_embedding = np.asarray([query_embedding], dtype=np.float32)
+    scores, ids = index.search(query_embedding, top_k * 5)
+
+    results = []
+    seen = set()
+
+    for score, idx in zip(scores[0], ids[0]):
+        if idx == -1:
+            continue
+        if score < 0.40:
+            continue
+        # Guard against a momentary index/metadata mismatch from a
+        # concurrent writer (index is always at least as new as metadata).
+        if idx >= len(metadata):
+            continue
+
+        item = metadata[idx]
+        key = (item["pdf_name"], item["page"], item["chunk"])
+
+        if key in seen:
+            continue
+        seen.add(key)
+
+        results.append((float(score), idx))
+        if len(results) >= top_k:
+            break
+
+    return results
+
+
+def _normalize_scores(merged):
+    """Min-max normalize each modality over its own candidate scores.
+
+    Returns a list of result dicts with normalized ``faiss_score`` /
+    ``bm25_score`` and the weighted ``hybrid_score`` (also exposed as
+    ``score`` for the existing UI), sorted by hybrid score descending.
+    """
+    faiss_vals = [v["faiss_raw"] for v in merged.values()
+                  if v["faiss_raw"] is not None]
+    bm25_vals = [v["bm25_raw"] for v in merged.values()
+                 if v["bm25_raw"] is not None]
+
+    def norm(value, values):
+        if value is None or not values:
+            return 0.0
+        lo, hi = min(values), max(values)
+        if hi - lo < 1e-12:
+            return 1.0
+        return (value - lo) / (hi - lo)
+
+    results = []
+    for v in merged.values():
+        faiss_score = norm(v["faiss_raw"], faiss_vals)
+        bm25_score = norm(v["bm25_raw"], bm25_vals)
+        hybrid_score = FAISS_WEIGHT * faiss_score + BM25_WEIGHT * bm25_score
+
+        result = v["item"].copy()
+        result["faiss_score"] = round(faiss_score, 4)
+        result["bm25_score"] = round(bm25_score, 4)
+        result["hybrid_score"] = round(hybrid_score, 4)
+        result["score"] = result["hybrid_score"]
+        results.append(result)
+
+    results.sort(key=lambda r: r["hybrid_score"], reverse=True)
+    return results
+
+
+def hybrid_search(query_text, query_embedding, top_k=5):
+    """Hybrid retrieval: FAISS semantic + BM25 keyword, fused by score.
+
+    Retrieves ``FAISS_CANDIDATES`` (default 10) semantic hits and
+    ``BM25_CANDIDATES`` (default 10) keyword hits, merges them by chunk key
+    ``(pdf_name, page, chunk)``, min-max normalizes each modality, then
+    combines them as ``FAISS_WEIGHT * norm_faiss + BM25_WEIGHT * norm_bm25``
+    and returns the top ``top_k`` chunks.
+
+    BM25 is kept consistent with FAISS by rebuilding from the exact metadata
+    list whenever the collection changes (see ``_mark_metadata_changed``), so
+    deleted PDFs never resurface through keyword search.
+    """
+    with _FAISS_LOCK:
+        if index is None:
+            with FileLock(LOCK_FILE):
+                _load()
+        else:
+            _maybe_reload()
+
+        if index.ntotal == 0:
+            logger.debug("[Hybrid] query=%r — empty index, no candidates",
+                         query_text)
+            return []
+
+        faiss_candidates = _faiss_candidates(query_embedding, FAISS_CANDIDATES)
+        bm25_candidates = bm25_search(
+            query_text, metadata, _METADATA_VERSION, BM25_CANDIDATES
+        )
+        logger.debug(
+            "[Hybrid] query=%r — FAISS candidates=%d, BM25 candidates=%d",
+            query_text, len(faiss_candidates), len(bm25_candidates),
+        )
+        logger.debug("[Hybrid] FAISS raw scores: %s",
+                     [(round(s, 4), i) for s, i in faiss_candidates])
+        logger.debug("[Hybrid] BM25 raw scores: %s",
+                     [(round(s, 4), i) for s, i in bm25_candidates])
+
+        merged = {}
+        for score, idx in faiss_candidates:
+            item = metadata[idx]
+            key = (item["pdf_name"], item["page"], item["chunk"])
+            merged[key] = {
+                "item": item, "faiss_raw": score, "bm25_raw": None,
+            }
+        for score, idx in bm25_candidates:
+            item = metadata[idx]
+            key = (item["pdf_name"], item["page"], item["chunk"])
+            if key in merged:
+                merged[key]["bm25_raw"] = score
+            else:
+                merged[key] = {
+                    "item": item, "faiss_raw": None, "bm25_raw": score,
+                }
+
+        scored = _normalize_scores(merged)
+        logger.debug(
+            "[Hybrid] normalized (faiss, bm25, hybrid): %s",
+            [(r["pdf_name"], r["page"], r["chunk"], r["faiss_score"],
+              r["bm25_score"], r["hybrid_score"]) for r in scored],
+        )
+        final = scored[:top_k]
+        logger.info(
+            "[Hybrid] query=%r — %d merged candidate(s), selected %d",
+            query_text, len(scored), len(final),
+        )
+        return final
 
 
 def total_vectors():

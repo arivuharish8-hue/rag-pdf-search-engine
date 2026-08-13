@@ -39,7 +39,10 @@ from utils.faiss_db import (
     save_all,
     total_vectors,
 )
-from utils.pdf_utils import extract_text_from_pdf
+from utils.pdf_utils import (
+    NO_EXTRACTABLE_TEXT_MESSAGE,
+    extract_text_from_pdf,
+)
 from utils.supabase_storage import download_file
 
 logger = logging.getLogger(__name__)
@@ -259,9 +262,13 @@ def extract_and_chunk(self, job_id):
             return _retry_or_fail(self, job_id, "EXTRACTING", exc)
 
     if len(chunks) == 0:
+        # A PDF with no selectable text (scanned / image-only) cannot be
+        # chunked, embedded or indexed.  Record a human-readable reason on
+        # the job and log it clearly instead of silently completing.
         update_job_status(job_id, status="COMPLETED", current_stage="COMPLETED",
-                          total_chunks=0, last_processed_chunk=0)
-        logger.info("[%s] extract: no text found, marked COMPLETED", job_id)
+                          total_chunks=0, last_processed_chunk=0,
+                          error_message=NO_EXTRACTABLE_TEXT_MESSAGE)
+        logger.warning("[%s] %s", job_id, NO_EXTRACTABLE_TEXT_MESSAGE)
         _cleanup_caches(job_id)
         return job_id
 

@@ -16,9 +16,20 @@
         button:hover { background:#0056b3; }
 
         .result { background:#fafafa; border-left:5px solid #007bff; padding:15px; margin-bottom:15px; border-radius:8px; }
-        .score { color:green; font-weight:bold; margin-bottom:8px; }
         .text { color:#333; line-height:1.6; }
         .query-label { margin-bottom:10px; color:#555; font-size:14px; }
+
+        .citation-link {
+            color:#0056b3; text-decoration:none; font-weight:bold;
+            padding:0 2px; cursor:pointer; white-space:nowrap;
+        }
+        .citation-link:hover { text-decoration:underline; color:#003d80; }
+
+        .source-entry { padding:8px 0; border-bottom:1px dashed #ddd; }
+        .source-entry:last-child { border-bottom:none; }
+        .source-link { color:#0056b3; text-decoration:none; font-weight:bold; word-break:break-all; }
+        .source-link:hover { text-decoration:underline; }
+        .source-meta { font-size:12px; color:#888; margin-top:2px; }
 
         .stats { text-align:center; color:#888; font-size:13px; margin-bottom:10px; }
 
@@ -68,6 +79,10 @@
 
     <h1>PDF Search Engine</h1>
 
+    {% if error %}
+    <div class="status error" style="display:block" role="alert">{{ error }}</div>
+    {% endif %}
+
     <!-- Upload -->
     <form method="POST" enctype="multipart/form-data">
         <h2>Upload PDF</h2>
@@ -98,6 +113,9 @@
                     {% if pdf.created_at %}
                     <span>{{ pdf.created_at[:10] }}</span>
                     {% endif %}
+                    {% if pdf.message %}
+                    <span style="color:#b26a00; width:100%;">{{ pdf.message }}</span>
+                    {% endif %}
                 </div>
             </div>
             <button type="button" class="btn-delete" data-name="{{ pdf.name }}">Delete</button>
@@ -109,7 +127,7 @@
     {% endif %}
 
     <!-- Search -->
-    <form method="POST">
+    <form method="POST" action="{{ url_for('search_route') }}">
         <h2>Search Query</h2>
         <input type="text" name="query" placeholder="Enter your question..." value="{{ query }}" required>
         <button type="submit">Search</button>
@@ -120,22 +138,22 @@
     <h2>Answer</h2>
     <div class="result">
         <div class="query-label"><strong>Query:</strong> {{ query }}</div>
-        <div class="text">{{ answer }}</div>
+        <div class="text">{% if answer_html %}{{ answer_html | safe }}{% else %}{{ answer }}{% endif %}</div>
     </div>
     {% endif %}
 
-    <!-- Results -->
-    {% if results %}
-    <h2>Top Results</h2>
-    {% for result in results %}
-    <div class="result">
-        <div class="score">Similarity Score: {{ result.score }}</div>
-        <div><strong>PDF:</strong> {{ result.pdf_name | default("Unknown") }}</div>
-        <div><strong>Page:</strong> {{ result.page }}</div>
-        <div><strong>Chunk:</strong> {{ result.chunk }}</div>
-        <div class="text"><strong>Text:</strong> {{ result.text }}</div>
+    {% if cited_sources %}
+    <h2>Sources</h2>
+    <div style="background: #fafafa; padding: 15px; border-radius: 8px; border: 1px solid #ccc;">
+        {% for src in cited_sources %}
+        <div class="source-entry">
+            <a href="{{ src.pdf_url }}#page={{ src.page }}" target="_blank" rel="noopener" class="source-link" title="Open {{ src.display_pdf_name }} at page {{ src.page }}">
+                [{{ src.citation_ids | join(', ') }}] {{ src.display_pdf_name }}
+            </a>
+            <div class="source-meta">Page {{ src.page }} · {% if src.chunks|length > 1 %}Chunks{% else %}Chunk{% endif %} {{ src.chunks | join(', ') }}</div>
+        </div>
+        {% endfor %}
     </div>
-    {% endfor %}
     {% endif %}
 
 </div>

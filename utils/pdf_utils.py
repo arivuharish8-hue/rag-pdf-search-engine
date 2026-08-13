@@ -7,6 +7,14 @@ from pypdf import PdfReader
 
 logger = logging.getLogger(__name__)
 
+# Shown to the user when a PDF yields no extractable text.  Such PDFs are
+# typically scanned/image-based, so they cannot participate in FAISS semantic
+# search or BM25 keyword search.
+NO_EXTRACTABLE_TEXT_MESSAGE = (
+    "No extractable text found in this PDF. "
+    "The PDF may be scanned/image-based."
+)
+
 
 def chunk_text(text, chunk_size=120, overlap=20):
     """Split text into small, overlapping word-based chunks."""
@@ -38,7 +46,7 @@ def extract_text_from_pdf(pdf_path, pdf_name):
         Returns an empty list if the PDF has no extractable text.
     """
     logger.info("[PDF] Opening %s (%s)", pdf_name, pdf_path)
-    reader = PdfReader(pdf_path)
+    reader = ader(pdf_path)
     total_pages = len(reader.pages)
     logger.info("[PDF] %s: %d page(s)", pdf_name, total_pages)
 
@@ -63,4 +71,8 @@ def extract_text_from_pdf(pdf_path, pdf_name):
 
     logger.info("[PDF] %s: extracted %d chunk(s) from %d page(s)",
                 pdf_name, len(all_chunks), total_pages)
+
+    if not all_chunks:
+        logger.warning("[PDF] %s: no extractable text found (the PDF may be "
+                       "scanned/image-based)", pdf_name)
     return all_chunks
