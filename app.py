@@ -70,8 +70,8 @@ app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 # Second-stage reranker: hybrid_search retrieves a larger candidate pool,
 # then a local cross-encoder re-ranks it before Gemini.  The model is
 # pre-cached in the image (see Dockerfile) and loaded lazily on first search.
-RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "20"))
-RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "5"))
+RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "10"))
+RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "2"))
 
 UPLOAD_FOLDER = "uploads"
 
@@ -126,10 +126,14 @@ GEMINI_FALLBACK_REASONS = {
         "quota or use an available model/API key."
     ),
     "auth": "Gemini API authentication failed. Please check the API key configuration.",
+    "unavailable": (
+        "Gemini service is temporarily unavailable. Please try again in a few moments."
+    ),
     "empty": (
         "Gemini did not return a usable answer for this query. "
         "Please try rephrasing your question."
     ),
+    "other": "The Gemini API request failed. Please check the server logs.",
 }
 
 
@@ -268,7 +272,7 @@ def _latest_job_for(all_jobs, pdf_name):
 
 def _status_from_job(job, pdf_name):
     if job is None:
-        return "indexed" if get_pdf_chunk_count(pdf_name) > 0 else "processing"
+        return "indexed"
     s = job["status"]
     if s == "COMPLETED":
         return "indexed"

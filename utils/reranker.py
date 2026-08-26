@@ -60,7 +60,7 @@ def rerank(query, candidates, top_k=5):
     try:
         model = _get_model()
         pairs = [(query, (c.get("text") or "")) for c in candidates]
-        scores = model.predict(pairs, show_progress_bar=False)
+        scores = model.predict(pairs, show_progress_bar=False)  # type: ignore[reportUnknownMemberType]
     except Exception:
         logger.error(
             "[Rerank] Scoring failed — using original candidate order",

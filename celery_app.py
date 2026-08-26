@@ -10,8 +10,8 @@ emits consistent, searchable log lines.
 
 import logging
 
-from celery import Celery
-from celery.signals import (
+from celery import Celery  # type: ignore[import-untyped]
+from celery.signals import (  # type: ignore[import-untyped]
     task_failure,
     task_postrun,
     task_prerun,
@@ -67,5 +67,5 @@ def on_task_failure(sender, task_id, exception, args, kwargs, traceback, **kw):
     task_name = getattr(sender, "name", None) or str(sender)
     logger.error(
         "[Celery] Task FAILED %s (task_id=%s, job_id=%s): %s",
-        task_name, task_id, job_id, exception, exc_info=traceback,
+        task_name, task_id, job_id, exception, exc_info=traceback,  # type: ignore[arg-type]
     )

@@ -511,6 +511,71 @@ def _normalize_scores(merged):
     return results
 
 
+def _direct_text_search(query_text, metadata, top_k=5):
+    """Fallback search for abbreviated names when BM25/FAISS return nothing.
+
+    Handles cases like "ms dhoni" matching "Mahendra Singh Dhoni" by:
+    1. Exact substring match (catches "Ms. Dhoni" directly)
+    2. Initials match: if short words in the query match the FIRST LETTERS
+       of words in the chunk text (e.g., "ms" matches "Mahendra Singh")
+    """
+    if not query_text or not metadata:
+        return []
+
+    from utils.bm25 import tokenize
+    from utils.query_normalizer import _PLAIN_WORD, _COMMON_WORDS
+
+    query_tokens = [w for w in tokenize(query_text) if len(w) >= 2
+                    and w not in _COMMON_WORDS]
+    if not query_tokens:
+        return []
+
+    # Identify which query tokens are short (potential abbreviations)
+    short_tokens = [t for t in query_tokens if len(t) <= 3]
+    long_tokens = [t for t in query_tokens if len(t) > 3]
+
+    results = []
+    for idx, item in enumerate(metadata):
+        text_lower = (item.get("text") or "").lower()
+        text_tokens = [t for t in tokenize(item.get("text") or "")
+                       if _PLAIN_WORD.fullmatch(t)]
+
+        score = 0.0
+
+        # Strategy 1: Exact substring match for each query token
+        exact_matches = sum(1 for t in query_tokens if t in text_lower)
+        if exact_matches == len(query_tokens):
+            score += 100.0  # All tokens found as substrings
+
+        # Strategy 2: Initials match for short tokens
+        # "ms" matches if text has consecutive words starting with m,s
+        if short_tokens and score == 0:
+            initials_ok = True
+            for short in short_tokens:
+                initials = list(short)
+                # Check if text has words starting with these initials in order
+                found = False
+                for i in range(len(text_tokens) - len(initials) + 1):
+                    if all(text_tokens[i + j].startswith(initials[j])
+                           for j in range(len(initials))):
+                        found = True
+                        break
+                if not found:
+                    initials_ok = False
+                    break
+            if initials_ok:
+                # Also check long tokens appear in text
+                long_ok = all(lt in text_lower for lt in long_tokens)
+                if long_ok:
+                    score += 80.0
+
+        if score > 0:
+            results.append((score, idx))
+
+    results.sort(key=lambda x: x[0], reverse=True)
+    return results[:top_k]
+
+
 def hybrid_search(query_text, query_embedding, top_k=5):
     """Hybrid retrieval: FAISS semantic + BM25 keyword, fused by score.
 
@@ -523,6 +588,9 @@ def hybrid_search(query_text, query_embedding, top_k=5):
     BM25 is kept consistent with FAISS by rebuilding from the exact metadata
     list whenever the collection changes (see ``_mark_metadata_changed``), so
     deleted PDFs never resurface through keyword search.
+
+    If FAISS and BM25 both return no results, a direct text pattern search
+    is attempted as a fallback for abbreviated names.
     """
     with _FAISS_LOCK:
         if index is None:
@@ -548,6 +616,16 @@ def hybrid_search(query_text, query_embedding, top_k=5):
                      [(round(s, 4), i) for s, i in faiss_candidates])
         logger.debug("[Hybrid] BM25 raw scores: %s",
                      [(round(s, 4), i) for s, i in bm25_candidates])
+
+        # Fallback: if both FAISS and BM25 return nothing, try direct text search
+        if not faiss_candidates and not bm25_candidates and query_text:
+            logger.info("[Hybrid] No FAISS/BM25 results, trying direct text search")
+            direct_candidates = _direct_text_search(query_text, metadata, FAISS_CANDIDATES)
+            if direct_candidates:
+                logger.info("[Hybrid] Direct text search found %d candidates",
+                           len(direct_candidates))
+                # Use direct search results as BM25 candidates
+                bm25_candidates = direct_candidates
 
         merged = {}
         for score, idx in faiss_candidates:

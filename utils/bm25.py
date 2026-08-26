@@ -79,3 +79,28 @@ def search(query_text, metadata, version, top_k=10):
         if len(results) >= top_k:
             break
     return results
+
+
+def search_abbreviated_name(short_name, full_name_parts, metadata, version, top_k=10):
+    """Search for chunks containing an abbreviated name pattern.
+
+    This is a fallback for when abbreviation expansion fails. It directly
+    searches for the full name parts in the chunk text.
+
+    Args:
+        short_name: The abbreviated query (e.g. "ms dhoni")
+        full_name_parts: List of words from the expansion (e.g. ["mahendra", "singh"])
+        metadata: The chunk metadata list
+        version: BM25 version for consistency
+        top_k: Maximum results to return
+
+    Returns:
+        List of (score, metadata_index) tuples for matching chunks.
+    """
+    if not full_name_parts or not metadata:
+        return []
+
+    # Build a query from the full name parts + any remaining query words
+    # This searches for chunks containing the expanded name
+    expanded_query = " ".join(full_name_parts)
+    return search(expanded_query, metadata, version, top_k)

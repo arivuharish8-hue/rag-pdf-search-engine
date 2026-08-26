@@ -656,7 +656,7 @@
                                     if (lib) lib.insertAdjacentElement('afterend', div);
                                 }
                             }
-                            refreshTotalVectors();
+                    refreshTotalVectors(pdfs);
                         } else {
                             btn.innerHTML = original;
                             btn.disabled = false;
@@ -671,27 +671,24 @@
             });
         });
 
-        function refreshTotalVectors() {
-            fetch('/pdfs')
-                .then(function (r) { return r.json(); })
-                .then(function (pdfs) {
-                    var el = document.getElementById('total-vectors');
-                    if (el) {
-                        var total = 0;
-                        if (Array.isArray(pdfs)) {
-                            pdfs.forEach(function (p) { if (p.status === 'indexed') total += (p.chunks || 0); });
-                        }
-                        el.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg>Total vectors: ' + total;
-                    }
-                })
-                .catch(function () {});
+        function refreshTotalVectors(pdfs) {
+            var el = document.getElementById('total-vectors');
+            if (!el) return;
+            var total = 0;
+            if (Array.isArray(pdfs)) {
+                pdfs.forEach(function (p) { if (p.status === 'indexed') total += (p.chunks || 0); });
+            }
+            el.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg>Total vectors: ' + total;
         }
+
+        var pollTimer = null;
 
         function pollStatuses() {
             fetch('/pdfs')
                 .then(function (r) { return r.json(); })
                 .then(function (pdfs) {
                     if (!Array.isArray(pdfs)) return;
+                    var needsPolling = false;
                     document.querySelectorAll('.pdf-card').forEach(function (card) {
                         var nameEl = card.querySelector('.pdf-name');
                         if (!nameEl) return;
@@ -702,6 +699,7 @@
                         pdfs.forEach(function (p) { if (p.name === name) found = p; });
                         if (!found) return;
                         var status = found.status || 'queued';
+                        if (status === 'processing' || status === 'queued') needsPolling = true;
                         var badge = document.createElement('span');
                         badge.className = 'badge badge-' + status;
                         if (status === 'indexed') {
@@ -722,7 +720,11 @@
                         var chunksSpan = meta.querySelectorAll('span')[1];
                         if (chunksSpan) chunksSpan.textContent = found.chunks + ' chunks';
                     });
-                    refreshTotalVectors();
+                    refreshTotalVectors(pdfs);
+                    if (!needsPolling && pollTimer) {
+                        clearInterval(pollTimer);
+                        pollTimer = null;
+                    }
                 })
                 .catch(function () {});
         }
@@ -738,7 +740,7 @@
             window.scrollTo({ top: searchForm.offsetTop - 120, behavior: 'smooth' });
         });
 
-        setInterval(pollStatuses, 5000);
+        pollTimer = setInterval(pollStatuses, 5000);
     });
 </script>
 </body>

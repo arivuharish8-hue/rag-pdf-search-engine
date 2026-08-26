@@ -1,52 +1,38 @@
-"""Safe typo-tolerant query normalization for retrieval.
+"""Safe typo-tolerant query normalization with abbreviation expansion.
 
-Runs *before* BM25 + FAISS retrieval.  It performs ONLY conservative
-spelling/typo correction and NEVER rewrites, paraphrases or restructures a
-valid question:
+Runs *before* BM25 + FAISS retrieval.  It performs:
+  1. Abbreviation expansion: short tokens (2-3 chars) that look like initials
+     are expanded to matching multi-word phrases from the corpus vocabulary.
+     e.g. "ms" -> "mahendra singh", "ap" -> "andhra pradesh"
+  2. Conservative spelling/typo correction: a token is only rewritten when it
+     is clearly NOT a valid word and has exactly one close vocabulary match.
 
-  * question words (``what``, ``who``, ``where``, ``when``, ``how``, ...) and
-    ordinary English function words are never treated as typos -- a valid
-    question such as "what are the achievements of haridass" passes through
-    exactly as written,
-  * a token is only rewritten when it is clearly NOT a valid word: not in the
-    indexed corpus, not a common English word, a plain lower-case /
-    capitalized word (no digits, no all-caps acronyms, no CVE / number / ID
-    tokens), and it has exactly one close vocabulary match within a bounded
-    edit distance that is strictly closer than every other candidate.
-
-Anything else -- correct spellings, question words, function words, technical
-terms, numbers, IDs, acronyms, names already present in the corpus -- is left
-untouched.  When no token can be safely corrected the original query is
-returned unchanged.  ``normalize_query`` returns the same object when nothing
-changed, so callers can cheaply detect whether an actual typo was corrected.
-The ORIGINAL query is preserved for display and for the answer generator; the
-minimally corrected form is used only for retrieval.
+Question words and function words are NEVER rewritten.  The ORIGINAL query is
+preserved for display and for the answer generator; the minimally corrected
+form is used only for retrieval.
 """
 
 import re
 import threading
+from itertools import product as _product
 
 from utils.bm25 import tokenize as bm25_tokenize
 
 # Tokens shorter than this are too ambiguous to correct.
 _MIN_TOKEN_LENGTH = 4
-# Edit-distance budget: 1 for short tokens, 2 for longer ones.
-_MAX_EDIT = 1
-_MAX_EDIT_LONG = 2
-_LONG_TOKEN_LENGTH = 8
 
-# Only bare alpha words are considered as typos or as candidate corrections.
-# Anything with digits, hyphens, underscores etc. is treated as an exact
-# identifier (CVE-2021-3560, ID_POLKIT, v2.5) and never touched.
+# Abbreviation expansion: tokens of this length or shorter are candidates for
+# expansion into multi-word phrases from the corpus.
+_ABBREV_MAX_LENGTH = 3
+# Minimum expansion length: only expand if the replacement has at least this
+# many words (e.g. "ms" -> "mahendra singh" is 2 words, acceptable).
+_ABBREV_MIN_WORDS = 2
+
+# Only bare alpha words are considered as abbreviations, typos or candidates.
 _PLAIN_WORD = re.compile(r"^[a-z]+$")
 _LETTERS = re.compile(r"[a-zA-Z]+")
 
-# Common English words that are NEVER treated as typos.  A token in this set
-# is a valid word, so rewriting it (e.g. "what" -> "that") would corrupt the
-# user's question rather than fix a typo.  This keeps every question word and
-# function word intact ("what are the achievements of haridass" stays exactly
-# as written) while still allowing genuine misspellings ("achivements",
-# "shanumugam") to be corrected because those are not real words.
+# Common English words that are NEVER treated as typos or abbreviations.
 _COMMON_WORDS = frozenset(
     # question words
     "what who where when how why which whose whom whatever whoever"
@@ -73,6 +59,131 @@ _COMMON_WORDS = frozenset(
     " please tell show give name list describe explain know"
     .split()
 )
+
+
+def _is_abbreviation_token(token):
+    """Return True if *token* looks like an abbreviation/initials.
+
+    Common English words (question words, prepositions, etc.) are NEVER
+    treated as abbreviations even if they are short.
+    """
+    lower = token.lower()
+    # Skip common English words — "who", "is", "what", etc. are not abbreviations
+    if lower in _COMMON_WORDS:
+        return False
+    # All-caps acronyms like "USA" or "BJP" — treat as abbreviations
+    if token.isupper() and len(token) <= _ABBREV_MAX_LENGTH:
+        return True
+    # Short lowercase/capitalized tokens like "ms", "Msk", "ap"
+    if len(token) <= _ABBREV_MAX_LENGTH and _PLAIN_WORD.fullmatch(lower):
+        return True
+    return False
+
+
+def _expand_abbreviations(query, vocab):
+    """Expand short abbreviation tokens in *query* using corpus vocabulary.
+
+    Only expands tokens that look like abbreviations (2-3 chars) and can be
+    matched to multi-word phrases in the corpus.  Returns the expanded query
+    or the original if nothing changed.
+
+    Expansion requires that the candidate words appear ADJACENT in the corpus
+    (as a name phrase), preventing random expansions like "ms" -> "management system".
+    """
+    if not query or not vocab:
+        return query
+
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    from utils import faiss_db
+    metadata = faiss_db.metadata or []
+
+    # Build word list and adjacent word-pair set from corpus
+    all_words = set()
+    word_pairs = set()  # (word1, word2) when adjacent in a chunk
+    word_freq = {}
+
+    for m in metadata:
+        text = m.get("text") or ""
+        tokens = [t.lower() for t in bm25_tokenize(text) if _PLAIN_WORD.fullmatch(t)]
+        all_words.update(tokens)
+        for t in tokens:
+            word_freq[t] = word_freq.get(t, 0) + 1
+        for i in range(len(tokens) - 1):
+            word_pairs.add((tokens[i], tokens[i + 1]))
+
+    word_list = sorted(all_words)
+    if not word_list:
+        return query
+
+    _logger.debug("[QueryNorm] vocab=%d, words=%d, pairs=%d",
+                  len(vocab), len(word_list), len(word_pairs))
+
+    out = []
+    last = 0
+    changed = False
+
+    for m in _LETTERS.finditer(query):
+        out.append(query[last:m.start()])
+        token = m.group(0)
+
+        if _is_abbreviation_token(token) and len(token) <= _ABBREV_MAX_LENGTH:
+            initials = list(token.lower())
+            candidates_per_letter = []
+            valid = True
+            for letter in initials:
+                matching = [w for w in word_list if w.startswith(letter)]
+                if not matching:
+                    valid = False
+                    break
+                # Top 10 by frequency
+                matching.sort(key=lambda w: (-word_freq.get(w, 0), w))
+                candidates_per_letter.append(matching[:10])
+
+            if valid and candidates_per_letter:
+                best_expansion = None
+                best_pair_score = -1
+
+                for combo in _product(*candidates_per_letter):
+                    if len(combo) < _ABBREV_MIN_WORDS:
+                        continue
+                    # ONLY accept expansions where adjacent words actually
+                    # appear together in the corpus — prevents random pairings
+                    pair_hits = sum(
+                        1 for i in range(len(combo) - 1)
+                        if (combo[i], combo[i + 1]) in word_pairs
+                    )
+                    if pair_hits > best_pair_score:
+                        best_pair_score = pair_hits
+                        best_expansion = combo
+
+                if best_expansion and best_pair_score > 0:
+                    expansion = " ".join(best_expansion)
+                    _logger.info("[QueryNorm] Expanded %r -> %r (pair_hits=%d)",
+                                 token, expansion, best_pair_score)
+                    out.append(expansion)
+                    changed = True
+                    last = m.end()
+                    continue
+                else:
+                    _logger.debug(
+                        "[QueryNorm] No co-occurring expansion for %r "
+                        "(best_pair_score=%d)", token, best_pair_score)
+
+        out.append(token)
+        last = m.end()
+
+    if not changed:
+        return query
+    out.append(query[last:])
+    return "".join(out)
+
+
+# Edit-distance budget: 1 for short tokens, 2 for longer ones.
+_MAX_EDIT = 1
+_MAX_EDIT_LONG = 2
+_LONG_TOKEN_LENGTH = 8
 
 _vocab = frozenset()
 _vocab_owner = None
@@ -191,11 +302,31 @@ def normalize_query(query):
     """Normalize *query* against the live indexed corpus.
 
     Entry point used by the search route, before FAISS/BM25 retrieval.
+    First tries abbreviation expansion, then typo correction.
     """
     if not query or not query.strip():
         return query
     from utils import faiss_db  # lazy: avoids import-time dependency on app
+    import logging
+    _logger = logging.getLogger(__name__)
+
     vocab = _get_vocab(faiss_db.metadata)
     if not vocab:
+        _logger.debug("[QueryNorm] No vocabulary, returning original query")
         return query
-    return normalize_query_with_vocab(query, vocab)
+
+    _logger.debug("[QueryNorm] Input query: %r, vocab size: %d", query, len(vocab))
+
+    # Step 1: Try abbreviation expansion (e.g. "ms dhoni" -> "mahendra singh dhoni")
+    expanded = _expand_abbreviations(query, vocab)
+    if expanded is not query:
+        # Abbreviation was expanded — use expanded form for retrieval
+        # but also run typo correction on the expanded form
+        _logger.info("[QueryNorm] Abbreviation expanded: %r -> %r", query, expanded)
+        return normalize_query_with_vocab(expanded, vocab)
+
+    # Step 2: No abbreviation expansion — try typo correction
+    result = normalize_query_with_vocab(query, vocab)
+    if result is not query:
+        _logger.info("[QueryNorm] Typo corrected: %r -> %r", query, result)
+    return result
