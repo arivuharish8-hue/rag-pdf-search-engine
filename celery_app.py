@@ -48,23 +48,24 @@ def on_worker_ready(sender, **kwargs):
 
 
 @task_prerun.connect
-def on_task_prerun(task_id, task, args, kwargs, **kw):
-    job_id = (args[0] if args else None) or (kwargs.get("job_id"))
+def on_task_prerun(sender, task_id, task, args, kwargs, **kw):
+    job_id = (args[0] if args else None) or ((kwargs or {}).get("job_id"))
     logger.info("[Queue] Received task %s (task_id=%s, job_id=%s)",
                 task.name, task_id, job_id)
 
 
 @task_postrun.connect
-def on_task_postrun(task_id, task, args, kwargs, retval, **kw):
-    job_id = (args[0] if args else None) or (kwargs.get("job_id"))
+def on_task_postrun(sender, task_id, task, args, kwargs, retval, **kw):
+    job_id = (args[0] if args else None) or ((kwargs or {}).get("job_id"))
     logger.info("[Celery] Task succeeded %s (task_id=%s, job_id=%s)",
                 task.name, task_id, job_id)
 
 
 @task_failure.connect
-def on_task_failure(task_id, exception, args, kwargs, traceback, **kw):
-    job_id = (args[0] if args else None) or (kwargs.get("job_id"))
+def on_task_failure(sender, task_id, exception, args, kwargs, traceback, **kw):
+    job_id = (args[0] if args else None) or ((kwargs or {}).get("job_id"))
+    task_name = getattr(sender, "name", None) or str(sender)
     logger.error(
         "[Celery] Task FAILED %s (task_id=%s, job_id=%s): %s",
-        kw.get("name"), task_id, job_id, exception, exc_info=traceback,
+        task_name, task_id, job_id, exception, exc_info=traceback,
     )

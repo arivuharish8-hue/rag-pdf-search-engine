@@ -36,9 +36,9 @@ def tokenize(text):
 def build(metadata, version):
     """(Re)build the BM25 index from ``metadata`` chunk texts."""
     global _bm25, _built_version
-    corpus = [tokenize(m["text"]) for m in metadata]
+    corpus = [tokenize(m.get("text", "")) for m in metadata]
     with _LOCK:
-        if corpus:
+        if any(corpus):
             _bm25 = BM25Okapi(corpus)
         else:
             _bm25 = None  # empty collection — rank_bm25 cannot index 0 docs
@@ -50,8 +50,8 @@ def _ensure(metadata, version):
     global _bm25, _built_version
     with _LOCK:
         if _bm25 is None or _built_version != version:
-            corpus = [tokenize(m["text"]) for m in metadata]
-            if corpus:
+            corpus = [tokenize(m.get("text", "")) for m in metadata]
+            if any(corpus):
                 _bm25 = BM25Okapi(corpus)
             else:
                 _bm25 = None

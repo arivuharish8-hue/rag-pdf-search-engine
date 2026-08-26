@@ -1,10 +1,13 @@
 """Gemini-powered, context-grounded answer generation for the RAG app."""
 
+import logging
 import os
 import re
 import time
 
 from google import genai
+
+logger = logging.getLogger(__name__)
 
 
 NOT_FOUND_MESSAGE = "No relevant information was found in the uploaded documents."
@@ -58,6 +61,76 @@ def _classify_exception(exc):
             return "quota"
         return "rate_limit"
     return "other"
+
+
+def _get_finish_reason(response):
+    """Return the finish reason string from the first candidate, or 'NONE'."""
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            candidate = candidates[0]
+            fr = getattr(candidate, "finish_reason", None)
+            return str(fr) if fr is not None else "UNKNOWN"
+    except Exception:
+        pass
+    return "NONE"
+
+
+def _extract_response_text(response):
+    """Safely extract the generated text from a Gemini response object.
+
+    The google-genai SDK's ``response.text`` property raises an exception when
+    the response was blocked by safety filters, when there are no candidates,
+    or when the candidate content has no text parts.  This helper tries
+    ``response.text`` first and, on failure, walks
+    ``candidates[0].content.parts`` to find the first text-bearing part.
+    Returns a stripped string or ``""`` if nothing usable is found.
+    """
+    # 1. Try the convenience property first (works when response is unblocked)
+    try:
+        text = response.text
+        if text and text.strip():
+            return text.strip()
+    except Exception as exc:
+        logger.info(
+            "[Gemini] response.text raised %s: %s — falling back to "
+            "candidate inspection",
+            type(exc).__name__, exc,
+        )
+
+    # 2. Walk candidates → content → parts manually
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            logger.warning("[Gemini] No candidates in response")
+            return ""
+
+        candidate = candidates[0]
+        content = getattr(candidate, "content", None)
+        if content is None:
+            logger.warning("[Gemini] First candidate has no content")
+            return ""
+
+        parts = getattr(content, "parts", None) or []
+        texts = []
+        for part in parts:
+            t = getattr(part, "text", None)
+            if t and t.strip():
+                texts.append(t.strip())
+
+        if texts:
+            combined = "\n".join(texts)
+            logger.info(
+                "[Gemini] Recovered text from %d part(s), total length=%d",
+                len(texts), len(combined),
+            )
+            return combined
+    except Exception as exc:
+        logger.error(
+            "[Gemini] Candidate inspection failed: %s", exc, exc_info=True,
+        )
+
+    return ""
 
 
 def generate_answer(question, results):
@@ -135,20 +208,42 @@ Answer:"""
                 contents=prompt,
                 config={"max_output_tokens": 1024},
             )
-            answer = (response.text or "").strip()
+
+            # ── Diagnostic logging (no API key) ─────────────────────────
+            logger.info(
+                "[Gemini] HTTP success — response type=%s, candidates=%s",
+                type(response).__name__,
+                len(response.candidates) if response.candidates else 0,
+            )
+
+            # ── Extract text from the response ──────────────────────────
+            answer = _extract_response_text(response)
+
             if not answer:
+                # Log the finish reason to help debug blocked / empty replies
+                finish = _get_finish_reason(response)
+                logger.warning(
+                    "[Gemini] Empty answer extracted — finish_reason=%s, "
+                    "candidate_count=%s",
+                    finish,
+                    len(response.candidates) if response.candidates else 0,
+                )
                 raise GeminiGenerationError(
                     "Gemini returned an empty answer.", kind="empty"
                 )
+
+            logger.info("[Gemini] Extracted answer length=%d", len(answer))
             return answer
+
         except GeminiGenerationError:
             raise
         except Exception as exc:
-            # Preserve the provider's message (for example, an invalid API key,
-            # unavailable model, or quota issue) instead of hiding it behind a
-            # generic UI error.  Chaining keeps the full traceback in Flask logs.
             detail = str(exc).strip() or exc.__class__.__name__
             kind = _classify_exception(exc)
+            logger.error(
+                "[Gemini] Attempt %d failed (kind=%s): %s",
+                attempt, kind, detail, exc_info=True,
+            )
             if kind != "rate_limit" or attempt == MAX_ATTEMPTS:
                 raise GeminiGenerationError(
                     f"Gemini API request failed: {detail}", kind=kind

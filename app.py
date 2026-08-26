@@ -126,6 +126,10 @@ GEMINI_FALLBACK_REASONS = {
         "quota or use an available model/API key."
     ),
     "auth": "Gemini API authentication failed. Please check the API key configuration.",
+    "empty": (
+        "Gemini did not return a usable answer for this query. "
+        "Please try rephrasing your question."
+    ),
 }
 
 
