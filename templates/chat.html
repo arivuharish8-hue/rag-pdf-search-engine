@@ -654,6 +654,8 @@
         sending = true;
         sendBtn.disabled = true;
 
+        var sentSessionId = currentSessionId;
+
         // Hide welcome, show messages
         welcomeState.style.display = 'none';
         messagesContainer.style.display = 'block';
@@ -673,12 +675,19 @@
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                session_id: currentSessionId,
+                session_id: sentSessionId,
                 message: text
             })
         })
         .then(function (r) { return r.json(); })
         .then(function (data) {
+            // If the user navigated away while waiting, don't update the current UI
+            if (currentSessionId !== sentSessionId) {
+                // Just reload sessions so the sidebar title might update if it was a new chat
+                loadSessions();
+                return;
+            }
+
             typingIndicator.classList.remove('show');
 
             if (data.error) {
@@ -699,13 +708,21 @@
             scrollToBottom();
         })
         .catch(function (err) {
-            typingIndicator.classList.remove('show');
-            appendMessage('assistant', 'Network error. Please try again.', []);
+            if (currentSessionId === sentSessionId) {
+                typingIndicator.classList.remove('show');
+                appendMessage('assistant', 'Network error. Please try again.', []);
+            }
         })
         .finally(function () {
             sending = false;
             sendBtn.disabled = false;
-            chatInput.focus();
+            // Only focus if we are still on the same chat, though it doesn't hurt much otherwise
+            if (currentSessionId === sentSessionId || sentSessionId === null) {
+                chatInput.focus();
+            } else {
+                // If they navigated away, we must also ensure typing indicator is hidden in the new chat!
+                typingIndicator.classList.remove('show');
+            }
         });
     }
 

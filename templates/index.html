@@ -1012,7 +1012,7 @@
 
     var _chatCurrentSessionId = null;
     var _chatSessions = [];
-    var _chatSending = false;
+    var _sessionLoading = new Map();
 
     var _sidebar = document.getElementById('sidebar');
     var _sidebarHistory = document.getElementById('sidebar-history');
@@ -1026,6 +1026,19 @@
     var _sendBtn = document.getElementById('send-btn');
     var _newChatBtn = document.getElementById('new-chat-btn');
     var _hintChips = document.getElementById('hint-chips');
+
+    function _isSessionLoading(sessionId) {
+        return _sessionLoading.get(sessionId) === true;
+    }
+
+    function _updateTypingIndicator() {
+        if (!_typingIndicator) return;
+        if (_chatCurrentSessionId && _isSessionLoading(_chatCurrentSessionId)) {
+            _typingIndicator.classList.add('show');
+        } else {
+            _typingIndicator.classList.remove('show');
+        }
+    }
 
     function _closeSidebarMobile() {
         if (_sidebar && window.innerWidth <= 768) _sidebar.classList.remove('open');
@@ -1088,7 +1101,9 @@
     function _clearMessages() {
         if (!_messagesList) return;
         _messagesList.innerHTML = '';
+        // Re-append typing indicator (innerHTML='' destroyed it from the DOM)
         if (_typingIndicator) {
+            _typingIndicator.classList.remove('show');
             _messagesList.appendChild(_typingIndicator);
         }
     }
@@ -1096,7 +1111,7 @@
     if (_newChatBtn) {
         _newChatBtn.addEventListener('click', function () {
             _chatCurrentSessionId = null;
-            _chatSending = false;
+            _sessionLoading.clear();
             if (_sendBtn) _sendBtn.disabled = false;
             if (_headerTitle) _headerTitle.textContent = 'New Chat';
             if (_welcomeState) _welcomeState.style.display = 'flex';
@@ -1119,6 +1134,11 @@
     }
 
     function _loadSession(sessionId) {
+        // Immediately switch active session and hide any stale typing indicator
+        _chatCurrentSessionId = sessionId;
+        if (_typingIndicator) _typingIndicator.classList.remove('show');
+        _renderSidebar();
+
         fetch('/chat/sessions/' + sessionId)
             .then(function (r) { return r.json(); })
             .then(function (data) {
@@ -1126,7 +1146,6 @@
                     console.error('[Chat] Session load error:', data.error);
                     return;
                 }
-                _chatCurrentSessionId = sessionId;
                 if (_headerTitle) _headerTitle.textContent = data.session.title || 'Chat';
                 _clearMessages();
                 var msgs = data.messages || [];
@@ -1139,7 +1158,7 @@
                 }
                 if (_welcomeState) _welcomeState.style.display = 'none';
                 if (_messagesContainer) _messagesContainer.style.display = 'block';
-                _renderSidebar();
+                _updateTypingIndicator();
                 _scrollToBottom();
             })
             .catch(function (err) {
@@ -1150,9 +1169,9 @@
     function _deleteSession(sessionId) {
         fetch('/chat/sessions/' + sessionId, { method: 'DELETE' })
             .then(function () {
+                _sessionLoading.delete(sessionId);
                 if (sessionId === _chatCurrentSessionId) {
                     _chatCurrentSessionId = null;
-                    _chatSending = false;
                     if (_sendBtn) _sendBtn.disabled = false;
                     if (_headerTitle) _headerTitle.textContent = 'New Chat';
                     if (_welcomeState) _welcomeState.style.display = 'flex';
@@ -1170,9 +1189,17 @@
     function _doSendMessage() {
         if (!_chatInput) return;
         var text = _chatInput.value.trim();
-        if (!text || _chatSending) return;
+        if (!text) return;
 
-        _chatSending = true;
+        // Determine the session this request belongs to (may be null for new chat)
+        var requestSessionId = _chatCurrentSessionId;
+        // Track the original key for clearing loading state in finally
+        var loadingKey = requestSessionId;
+
+        // Block if THIS session is already loading
+        if (requestSessionId && _isSessionLoading(requestSessionId)) return;
+
+        _sessionLoading.set(loadingKey, true);
         if (_sendBtn) _sendBtn.disabled = true;
 
         try {
@@ -1184,12 +1211,13 @@
             _chatInput.style.height = 'auto';
             _scrollToBottom();
 
-            if (_typingIndicator) _typingIndicator.classList.add('show');
+            _updateTypingIndicator();
             _scrollToBottom();
         } catch (e) {
             console.error('[Chat] UI error before fetch:', e);
-            _chatSending = false;
+            _sessionLoading.set(loadingKey, false);
             if (_sendBtn) _sendBtn.disabled = false;
+            _updateTypingIndicator();
             return;
         }
 
@@ -1197,37 +1225,63 @@
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                session_id: _chatCurrentSessionId,
+                session_id: requestSessionId,
                 message: text
             })
         })
         .then(function (r) { return r.json(); })
         .then(function (data) {
-            if (_typingIndicator) _typingIndicator.classList.remove('show');
+            // Determine if this response belongs to the currently active session.
+            // For new chats, requestSessionId is null; match if _chatCurrentSessionId is also null.
+            var isActive = (requestSessionId === _chatCurrentSessionId)
+                           || (data.session_id && data.session_id === _chatCurrentSessionId);
+
+            if (isActive) {
+                _updateTypingIndicator();
+            }
 
             if (data.error) {
-                _appendMessage('assistant', 'Error: ' + data.error, []);
-            } else {
-                _chatCurrentSessionId = data.session_id;
-                // Use answer_html (with clickable citation links) when available
-                var displayContent = data.answer_html || data.answer;
-                _appendMessage('assistant', displayContent, data.sources || []);
-                var matchedSess = _chatSessions.find(function (s) { return s.id === data.session_id; });
-                if (!matchedSess && _headerTitle) {
-                    _headerTitle.textContent = text.length > 50 ? text.substring(0, 50) + '...' : text;
+                if (isActive) {
+                    _appendMessage('assistant', 'Error: ' + data.error, []);
                 }
+            } else {
+                // Only update current session and render if this session is still active
+                if (isActive) {
+                    // Update session ID (handles new chat → first response)
+                    _chatCurrentSessionId = data.session_id;
+                    // Update loadingKey so finally clears the correct entry
+                    loadingKey = data.session_id;
+
+                    var displayContent = data.answer_html || data.answer;
+                    _appendMessage('assistant', displayContent, data.sources || []);
+                    var matchedSess = _chatSessions.find(function (s) { return s.id === data.session_id; });
+                    if (!matchedSess && _headerTitle) {
+                        _headerTitle.textContent = text.length > 50 ? text.substring(0, 50) + '...' : text;
+                    }
+                    _scrollToBottom();
+                }
+                // If not active, the response arrived for a session the user switched away from.
+                // The sidebar refresh below will pick up the new session.
             }
 
             _loadSessions();
-            _scrollToBottom();
         })
         .catch(function (err) {
             console.error('[Chat] Network error:', err);
-            if (_typingIndicator) _typingIndicator.classList.remove('show');
-            _appendMessage('assistant', 'Network error. Please try again.', []);
+            var isActive = (requestSessionId === _chatCurrentSessionId);
+            if (isActive) {
+                _updateTypingIndicator();
+                _appendMessage('assistant', 'Network error. Please try again.', []);
+            }
         })
         .finally(function () {
-            _chatSending = false;
+            // Clear loading state for the original request session
+            _sessionLoading.set(requestSessionId, false);
+            // If this was a new chat that resolved to a real session_id, clear that too
+            if (loadingKey !== requestSessionId) {
+                _sessionLoading.set(loadingKey, false);
+            }
+            _updateTypingIndicator();
             if (_sendBtn) _sendBtn.disabled = false;
             if (_chatInput) _chatInput.focus();
         });
