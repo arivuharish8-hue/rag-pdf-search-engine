@@ -1,5 +1,6 @@
 """Gemini-powered, context-grounded answer generation for the RAG app."""
 
+import concurrent.futures
 import logging
 import os
 import re
@@ -9,17 +10,41 @@ from google import genai
 
 logger = logging.getLogger(__name__)
 
+# Cached Gemini client — avoids re-creating on every call
+_client = None
+_client_key = None
+
+
+def _get_client():
+    """Return a cached genai.Client, creating one only when the API key changes."""
+    global _client, _client_key
+    api_key = os.getenv("GEMINI_API_KEY")
+    if _client is not None and _client_key == api_key:
+        return _client
+    _client = genai.Client(api_key=api_key)
+    _client_key = api_key
+    return _client
+
 
 NOT_FOUND_MESSAGE = "No relevant information was found in the uploaded documents."
-# A fast, non-reasoning model is appropriate for short, extractive RAG answers.
-# gemini-2.0-flash no longer has free-tier quota for this project (HTTP 429,
-# "limit: 0"), and the fixed gemini-2.5-flash endpoint is retired for new API
-# projects.  gemini-flash-latest is the Google-supported alias that follows the
-# current production Flash model and is available on the free tier.
-MODEL_NAME = "gemini-flash-latest"
+# Primary model with fallbacks for 503 UNAVAILABLE / overload errors.
+# Model names verified against Google API responses (2026-08-26):
+#   gemini-2.0-flash     -> now use gemini-3.6-flash
+#   gemini-2.0-flash-lite -> now use gemini-3.5-flash-lite
+MODEL_NAME = "gemini-3.5-flash-lite"
+MODEL_FALLBACKS = [
+    "gemini-3.5-flash-lite",
+    "gemini-flash-latest",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash",
+]
 
 MAX_ATTEMPTS = 3
-BACKOFF_SECONDS = (1, 2, 4)
+BACKOFF_SECONDS = (0.5, 1, 2)
+
+# Hard per-call timeout (seconds). gemini-flash-latest can hang indefinitely
+# when overloaded — this forces a fast failure so we can try the next model.
+CALL_TIMEOUT = 25
 
 
 class GeminiGenerationError(RuntimeError):
@@ -38,26 +63,23 @@ class GeminiGenerationError(RuntimeError):
 def _classify_exception(exc):
     """Map a google.genai exception to a failure kind.
 
-    Returns one of: "rate_limit", "quota", "auth", "other".
+    Returns one of: "rate_limit", "quota", "server_unavailable", "auth", "other".
     """
     code = getattr(exc, "code", None)
     status = getattr(exc, "status", "") or ""
     message = str(exc) or getattr(exc, "message", "") or ""
 
-    if code in (401, 403) or status.upper() in (
-        "UNAUTHENTICATED",
-        "PERMISSION_DENIED",
-    ):
+    if code in (401, 403) or status.upper() in ("UNAUTHENTICATED", "PERMISSION_DENIED"):
         return "auth"
     if "api key" in message.lower():
-        # e.g. 400 INVALID_ARGUMENT "API key not valid. Please pass a valid
-        # API key." — authentication/config problem, not a quota issue.
         return "auth"
+    if code == 503 or status.upper() == "UNAVAILABLE" or "503" in message:
+        return "server_unavailable"
+    if isinstance(exc, TimeoutError) or "timed out" in message.lower():
+        return "server_unavailable"
     if code == 429 or status.upper() == "RESOURCE_EXHAUSTED":
-        # "limit: 0" means the project has no free-tier allowance for this
-        # model (quota exhausted / billing restriction) — retrying cannot help.
         limits = re.findall(r"limit:\s*(\d+)", message)
-        if limits and all(int(value) == 0 for value in limits):
+        if limits and all(int(v) == 0 for v in limits):
             return "quota"
         return "rate_limit"
     return "other"
@@ -68,8 +90,7 @@ def _get_finish_reason(response):
     try:
         candidates = getattr(response, "candidates", None) or []
         if candidates:
-            candidate = candidates[0]
-            fr = getattr(candidate, "finish_reason", None)
+            fr = getattr(candidates[0], "finish_reason", None)
             return str(fr) if fr is not None else "UNKNOWN"
     except Exception:
         pass
@@ -77,58 +98,34 @@ def _get_finish_reason(response):
 
 
 def _extract_response_text(response):
-    """Safely extract the generated text from a Gemini response object.
-
-    The google-genai SDK's ``response.text`` property raises an exception when
-    the response was blocked by safety filters, when there are no candidates,
-    or when the candidate content has no text parts.  This helper tries
-    ``response.text`` first and, on failure, walks
-    ``candidates[0].content.parts`` to find the first text-bearing part.
-    Returns a stripped string or ``""`` if nothing usable is found.
-    """
-    # 1. Try the convenience property first (works when response is unblocked)
+    """Safely extract the generated text from a Gemini response object."""
     try:
         text = response.text
         if text and text.strip():
             return text.strip()
     except Exception as exc:
         logger.info(
-            "[Gemini] response.text raised %s: %s — falling back to "
-            "candidate inspection",
+            "[Gemini] response.text raised %s: %s — falling back to candidate inspection",
             type(exc).__name__, exc,
         )
 
-    # 2. Walk candidates → content → parts manually
     try:
         candidates = getattr(response, "candidates", None) or []
         if not candidates:
             logger.warning("[Gemini] No candidates in response")
             return ""
-
-        candidate = candidates[0]
-        content = getattr(candidate, "content", None)
+        content = getattr(candidates[0], "content", None)
         if content is None:
             logger.warning("[Gemini] First candidate has no content")
             return ""
-
         parts = getattr(content, "parts", None) or []
-        texts = []
-        for part in parts:
-            t = getattr(part, "text", None)
-            if t and t.strip():
-                texts.append(t.strip())
-
+        texts = [p.text.strip() for p in parts if getattr(p, "text", None) and p.text.strip()]
         if texts:
             combined = "\n".join(texts)
-            logger.info(
-                "[Gemini] Recovered text from %d part(s), total length=%d",
-                len(texts), len(combined),
-            )
+            logger.info("[Gemini] Recovered text from %d part(s), length=%d", len(texts), len(combined))
             return combined
     except Exception as exc:
-        logger.error(
-            "[Gemini] Candidate inspection failed: %s", exc, exc_info=True,
-        )
+        logger.error("[Gemini] Candidate inspection failed: %s", exc, exc_info=True)
 
     return ""
 
@@ -136,42 +133,24 @@ def _extract_response_text(response):
 def generate_answer(question, results):
     """Answer *question* using only the retrieved PDF chunk texts.
 
-    Args:
-        question: The user's search question.
-        results: An iterable of retrieved chunk metadata dicts containing pdf_name, page, chunk, and text.
-
-    Returns:
-        A context-grounded answer, or ``NOT_FOUND_MESSAGE`` when no context is
-        available or does not contain the answer.
-
-    Raises:
-        GeminiGenerationError: If the API key is missing or Gemini returns an
-            error or no usable text.  ``exc.kind`` classifies the failure as
-            "rate_limit", "quota", "auth", "empty", or "other".
+    Tries MODEL_FALLBACKS in order, enforcing CALL_TIMEOUT seconds per call.
+    Falls back to the next model on timeout, 503, or 404.
     """
     valid_results = [r for r in results if r.get("text") and r["text"].strip()]
-
     if not valid_results:
         return NOT_FOUND_MESSAGE
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise GeminiGenerationError(
-            "GEMINI_API_KEY is not configured.", kind="auth"
-        )
+        raise GeminiGenerationError("GEMINI_API_KEY is not configured.", kind="auth")
 
     context_blocks = []
     for index, res in enumerate(valid_results, start=1):
-        # The source number IS the citation ID: SOURCE n corresponds to the
-        # inline citation [n] in the answer.  Preserve citation_id (assigned
-        # after reranking) when present so the context always matches the
-        # mapping handed to the frontend.
         source_number = res.get("citation_id", index)
         context_blocks.append(
             f"[SOURCE {source_number}]\n"
             f"PDF: {res.get('pdf_name', 'Unknown')}\n"
-            f"Page: {res.get('page', 'Unknown')}\n"
-            f"Chunk: {res.get('chunk', 'Unknown')}\n\n"
+            f"Page: {res.get('page', 'Unknown')}\n\n"
             f"Text:\n{res['text'].strip()}"
         )
     context_block = "\n\n".join(context_blocks)
@@ -199,40 +178,47 @@ If the sources do not contain the answer, reply with exactly:
 Question: {question}
 Answer:"""
 
-    client = genai.Client(api_key=api_key)
+    client = _get_client()
 
+    def _call(model_name):
+        return client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config={"max_output_tokens": 1024},
+        )
+
+    last_exc = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        model = MODEL_FALLBACKS[(attempt - 1) % len(MODEL_FALLBACKS)]
         try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config={"max_output_tokens": 1024},
-            )
+            logger.info("[Gemini] Attempt %d/%d model=%s (timeout=%ds)",
+                        attempt, MAX_ATTEMPTS, model, CALL_TIMEOUT)
 
-            # ── Diagnostic logging (no API key) ─────────────────────────
-            logger.info(
-                "[Gemini] HTTP success — response type=%s, candidates=%s",
-                type(response).__name__,
-                len(response.candidates) if response.candidates else 0,
-            )
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = ex.submit(_call, model)
+            try:
+                response = future.result(timeout=CALL_TIMEOUT)
+                ex.shutdown(wait=False)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                ex.shutdown(wait=False)
+                raise TimeoutError(
+                    f"model {model} timed out after {CALL_TIMEOUT}s"
+                )
 
-            # ── Extract text from the response ──────────────────────────
+            logger.info("[Gemini] Success model=%s candidates=%s",
+                        model, len(response.candidates) if response.candidates else 0)
+
             answer = _extract_response_text(response)
-
             if not answer:
-                # Log the finish reason to help debug blocked / empty replies
                 finish = _get_finish_reason(response)
-                logger.warning(
-                    "[Gemini] Empty answer extracted — finish_reason=%s, "
-                    "candidate_count=%s",
-                    finish,
-                    len(response.candidates) if response.candidates else 0,
-                )
-                raise GeminiGenerationError(
-                    "Gemini returned an empty answer.", kind="empty"
-                )
+                logger.warning("[Gemini] Empty answer model=%s finish=%s", model, finish)
+                raise GeminiGenerationError("Gemini returned an empty answer.", kind="empty")
 
-            logger.info("[Gemini] Extracted answer length=%d", len(answer))
+            if "The model API is currently overloaded" in answer:
+                raise Exception("503 The model API is currently overloaded")
+
+            logger.info("[Gemini] Answer len=%d model=%s", len(answer), model)
             return answer
 
         except GeminiGenerationError:
@@ -240,12 +226,19 @@ Answer:"""
         except Exception as exc:
             detail = str(exc).strip() or exc.__class__.__name__
             kind = _classify_exception(exc)
-            logger.error(
-                "[Gemini] Attempt %d failed (kind=%s): %s",
-                attempt, kind, detail, exc_info=True,
-            )
-            if kind != "rate_limit" or attempt == MAX_ATTEMPTS:
+            last_exc = exc
+            logger.error("[Gemini] Attempt %d/%d model=%s kind=%s: %s",
+                         attempt, MAX_ATTEMPTS, model, kind, detail)
+            if kind in ("quota", "auth"):
                 raise GeminiGenerationError(
-                    f"Gemini API request failed: {detail}", kind=kind
+                    f"Gemini API failed: {detail}", kind=kind
                 ) from exc
-            time.sleep(BACKOFF_SECONDS[attempt - 1])
+            if attempt < MAX_ATTEMPTS:
+                sleep_secs = BACKOFF_SECONDS[min(attempt - 1, len(BACKOFF_SECONDS) - 1)]
+                logger.info("[Gemini] Retry in %ds...", sleep_secs)
+                time.sleep(sleep_secs)
+
+    raise GeminiGenerationError(
+        f"Gemini API failed after {MAX_ATTEMPTS} attempts: {last_exc}",
+        kind="other",
+    ) from last_exc
