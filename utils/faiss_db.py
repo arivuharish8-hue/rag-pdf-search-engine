@@ -44,8 +44,8 @@ REMOVE_VERIFY_DELAY = float(os.getenv("FAISS_REMOVE_VERIFY_DELAY", "0.6"))
 # Hybrid (FAISS + BM25) retrieval settings.
 FAISS_WEIGHT = float(os.getenv("FAISS_WEIGHT", "0.5"))
 BM25_WEIGHT = float(os.getenv("BM25_WEIGHT", "0.5"))
-FAISS_CANDIDATES = int(os.getenv("FAISS_CANDIDATES", "10"))
-BM25_CANDIDATES = int(os.getenv("BM25_CANDIDATES", "10"))
+FAISS_CANDIDATES = int(os.getenv("FAISS_CANDIDATES", "30"))
+BM25_CANDIDATES = int(os.getenv("BM25_CANDIDATES", "30"))
 
 DATABASE_DIR = "database"
 INDEX_FILE = os.path.join(DATABASE_DIR, "faiss.index")
@@ -440,9 +440,15 @@ def search(query_embedding, top_k=3):
 def _faiss_candidates(query_embedding, top_k):
     """FAISS semantic candidates as ``(raw_score, metadata_index)`` pairs.
 
-    Preserves the existing search semantics (IndexFlatIP dot product, the
-    0.40 similarity floor, dedupe by chunk key) but returns more candidates
-    than the final top-k so BM25-only hits are not starved out.
+    Preserves the existing search semantics (IndexFlatIP dot product,
+    dedupe by chunk key) but returns more candidates than the final top-k
+    so BM25-only hits are not starved out.
+
+    The similarity floor (0.01) is intentionally very low to allow the hybrid
+    scorer and reranker to make the final relevance decision.  A strict
+    floor here starves paraphrase queries whose FAISS embedding similarity
+    is low but whose BM25 keyword overlap is strong.  The cross-encoder
+    reranker (rerank_score > 0) is the true relevance gate.
     """
     query_embedding = np.asarray([query_embedding], dtype=np.float32)
     scores, ids = index.search(query_embedding, top_k * 5)
@@ -453,7 +459,7 @@ def _faiss_candidates(query_embedding, top_k):
     for score, idx in zip(scores[0], ids[0]):
         if idx == -1:
             continue
-        if score < 0.40:
+        if score < 0.01:
             continue
         # Guard against a momentary index/metadata mismatch from a
         # concurrent writer (index is always at least as new as metadata).
@@ -511,12 +517,36 @@ def _normalize_scores(merged):
     return results
 
 
+_BM25_STOPWORDS = frozenset(
+    "a an and are as at be but by for if in is it of on or so the to was "
+    "we what when where which who whom why how do does did have has had "
+    "this that these those i you he she they them your my our their his her "
+    "me us not no nor too very can could should would may might must will "
+    "shall just also into over under about from with without give tell show "
+    "name list describe explain know".split()
+)
+
+
+def _bm25_query_tokens(query_text):
+    """Return query tokens with stopwords stripped for BM25 scoring.
+
+    Stopwords like ``what``, ``are``, ``the``, ``of`` appear in nearly every
+    prose document and artificially inflate their BM25 scores, pushing
+    short / structured documents (resumes, lists) below the top-k cutoff.
+    Stripping them lets content words (``achievements``, ``haridass``) drive
+    ranking exclusively.
+    """
+    from utils.bm25 import tokenize as _tok
+    tokens = _tok(query_text)
+    return [t for t in tokens if t not in _BM25_STOPWORDS and len(t) >= 2]
+
+
 def hybrid_search(query_text, query_embedding, top_k=5):
     """Hybrid retrieval: FAISS semantic + BM25 keyword, fused by score.
 
     Retrieves ``FAISS_CANDIDATES`` (default 10) semantic hits and
     ``BM25_CANDIDATES`` (default 10) keyword hits, merges them by chunk key
-    ``(pdf_name, page, chunk)``, min-max normalizes each modality, then
+    ``(pdf_name, page, page, chunk)``, min-max normalizes each modality, then
     combines them as ``FAISS_WEIGHT * norm_faiss + BM25_WEIGHT * norm_bm25``
     and returns the top ``top_k`` chunks.
 
@@ -537,17 +567,24 @@ def hybrid_search(query_text, query_embedding, top_k=5):
             return []
 
         faiss_candidates = _faiss_candidates(query_embedding, FAISS_CANDIDATES)
+
+        bm25_tokens = _bm25_query_tokens(query_text)
+        bm25_query = " ".join(bm25_tokens) if bm25_tokens else query_text
         bm25_candidates = bm25_search(
-            query_text, metadata, _METADATA_VERSION, BM25_CANDIDATES
+            bm25_query, metadata, _METADATA_VERSION, BM25_CANDIDATES
         )
-        logger.debug(
-            "[Hybrid] query=%r — FAISS candidates=%d, BM25 candidates=%d",
-            query_text, len(faiss_candidates), len(bm25_candidates),
+        logger.info(
+            "[Hybrid] query=%r — FAISS=%d, BM25=%d raw candidates "
+            "(bm25_tokens=%s)",
+            query_text[:80], len(faiss_candidates), len(bm25_candidates),
+            bm25_tokens,
         )
-        logger.debug("[Hybrid] FAISS raw scores: %s",
-                     [(round(s, 4), i) for s, i in faiss_candidates])
-        logger.debug("[Hybrid] BM25 raw scores: %s",
-                     [(round(s, 4), i) for s, i in bm25_candidates])
+        if faiss_candidates:
+            logger.debug("[Hybrid] FAISS top scores: %s",
+                         [(round(s, 4), i) for s, i in faiss_candidates[:3]])
+        if bm25_candidates:
+            logger.debug("[Hybrid] BM25 top scores: %s",
+                         [(round(s, 4), i) for s, i in bm25_candidates[:3]])
 
         merged = {}
         for score, idx in faiss_candidates:

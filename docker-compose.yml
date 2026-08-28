@@ -48,6 +48,10 @@ services:
     volumes:
       - ./uploads:/app/uploads
       - ./database:/app/database
+      - ./app.py:/app/app.py
+      - ./tasks.py:/app/tasks.py
+      - ./utils:/app/utils
+      - ./templates:/app/templates
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -71,6 +75,10 @@ services:
     volumes:
       - ./uploads:/app/uploads
       - ./database:/app/database
+      - ./app.py:/app/app.py
+      - ./tasks.py:/app/tasks.py
+      - ./utils:/app/utils
+      - ./templates:/app/templates
     depends_on:
       rabbitmq:
         condition: service_healthy

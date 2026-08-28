@@ -70,7 +70,12 @@ def search(query_text, metadata, version, top_k=10):
     if bm25 is None:
         return []
 
-    scores = bm25.get_scores(tokenize(query_text))
+    from utils.query_normalizer import _COMMON_WORDS
+    query_tokens = [t for t in tokenize(query_text) if t not in _COMMON_WORDS]
+    if not query_tokens:
+        return []
+
+    scores = bm25.get_scores(query_tokens)
     results = []
     for idx in sorted(range(len(scores)), key=lambda i: scores[i], reverse=True):
         if scores[idx] <= 0:
