@@ -55,14 +55,14 @@ def on_task_prerun(sender, task_id, task, args, kwargs, **kw):
 
 
 @task_postrun.connect
-def on_task_postrun(sender, task_id, task, args, kwargs, retval, **kw):
+def on_task_postrun(sender, task_id, task, args, kwargs, retval, state, **kw):
     job_id = (args[0] if args else None) or ((kwargs or {}).get("job_id"))
     logger.info("[Celery] Task succeeded %s (task_id=%s, job_id=%s)",
                 task.name, task_id, job_id)
 
 
 @task_failure.connect
-def on_task_failure(sender, task_id, exception, args, kwargs, traceback, **kw):
+def on_task_failure(sender, task_id, exception, args, kwargs, traceback, einfo, **kw):
     job_id = (args[0] if args else None) or ((kwargs or {}).get("job_id"))
     task_name = getattr(sender, "name", None) or str(sender)
     logger.error(

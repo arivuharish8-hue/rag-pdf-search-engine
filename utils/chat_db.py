@@ -113,3 +113,25 @@ def get_recent_messages(session_id, limit=10):
     msgs = result.data or []
     msgs.reverse()
     return msgs
+
+
+def get_message(message_id):
+    """Return a single message by its id, or None."""
+    result = _MESSAGES_TABLE.select("*").eq("id", message_id).execute()
+    return result.data[0] if result.data else None
+
+
+def update_message_content(message_id, content):
+    """Update the content of a message."""
+    _MESSAGES_TABLE.update({"content": content}).eq("id", message_id).execute()
+
+
+def delete_messages_after(session_id, after_created_at):
+    """Delete all messages in a session created strictly after ``after_created_at``.
+
+    Used when editing a user message: the old assistant reply and any subsequent
+    messages are removed so the conversation branches from the edited point.
+    """
+    _MESSAGES_TABLE.delete().eq("session_id", session_id).gt(
+        "created_at", after_created_at
+    ).execute()

@@ -466,6 +466,54 @@
             font-weight: 700; font-size: 11px;
         }
 
+        /* ── Edit button ───────────────────────────────── */
+        .msg-actions {
+            display: none;
+            margin-top: 6px;
+        }
+        .msg.user:hover .msg-actions { display: flex; }
+        .msg.user .msg-actions { gap: 6px; }
+        .msg-edit-btn {
+            display: inline-flex; align-items: center; gap: 4px;
+            padding: 4px 10px; border-radius: 6px;
+            font-size: 11.5px; font-weight: 600; font-family: inherit;
+            background: var(--surface-2); border: 1px solid var(--border);
+            color: var(--text-3); cursor: pointer;
+            transition: all .15s ease;
+        }
+        .msg-edit-btn:hover {
+            background: var(--brand-soft); border-color: var(--info-border);
+            color: var(--brand);
+        }
+        .msg-edit-btn svg { flex: 0 0 auto; }
+        .msg.user.editing {
+            background: var(--brand-soft);
+            border: 1px solid var(--info-border);
+            border-radius: var(--radius-sm);
+            padding: 8px 10px;
+            margin: -4px 0 16px -4px;
+        }
+        .edit-banner {
+            display: none;
+            align-items: center; gap: 8px;
+            padding: 8px 14px;
+            background: var(--brand-soft);
+            border: 1px solid var(--info-border);
+            border-radius: var(--radius-sm);
+            margin-bottom: 10px;
+            font-size: 12.5px; color: var(--brand); font-weight: 600;
+        }
+        .edit-banner.show { display: flex; }
+        .edit-cancel-btn {
+            margin-left: auto;
+            padding: 3px 8px; border-radius: 5px;
+            font-size: 11px; font-weight: 600; font-family: inherit;
+            background: none; border: 1px solid var(--border);
+            color: var(--text-3); cursor: pointer;
+            transition: all .15s ease;
+        }
+        .edit-cancel-btn:hover { background: var(--danger-bg); color: var(--danger); border-color: var(--danger-border); }
+
         /* ── Typing indicator ───────────────────────────── */
         .typing {
             display: none;
@@ -562,6 +610,7 @@
             .messages { padding: 14px; }
             .input-bar { padding: 10px 14px 14px; }
             .alert { margin: 0 12px; }
+            .msg.user .msg-actions { display: flex; }
         }
         @media (max-width: 480px) {
             .doc-library { margin: 8px 8px 0; }
@@ -774,6 +823,11 @@
             <!-- Input bar -->
             <div class="input-bar">
                 <div class="input-bar-inner">
+                    <div class="edit-banner" id="edit-banner">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                        Editing message
+                        <button class="edit-cancel-btn" id="edit-cancel-btn">Cancel</button>
+                    </div>
                     <div class="input-row">
                         <textarea id="chat-input" rows="1" placeholder="Ask about your documents..." aria-label="Type your question"></textarea>
                         <button class="send-btn" id="send-btn" title="Send message" aria-label="Send">
@@ -1013,6 +1067,7 @@
     var _chatCurrentSessionId = null;
     var _chatSessions = [];
     var _sessionLoading = new Map();
+    var _chatSending = false;
 
     var _sidebar = document.getElementById('sidebar');
     var _sidebarHistory = document.getElementById('sidebar-history');
@@ -1026,6 +1081,17 @@
     var _sendBtn = document.getElementById('send-btn');
     var _newChatBtn = document.getElementById('new-chat-btn');
     var _hintChips = document.getElementById('hint-chips');
+
+    /* --- Edit message state --- */
+    var _editingMessageId = null;
+    var _editingOriginalContent = '';
+    /* Separate guard for edit requests — keeps edit independent of _chatSending */
+    var _editSending = false;
+
+    /* --- Debug logging helper (visible in browser console) --- */
+    function _dbg(msg) {
+        console.log('[Chat-Edit DEBUG] ' + msg);
+    }
 
     function _isSessionLoading(sessionId) {
         return _sessionLoading.get(sessionId) === true;
@@ -1042,6 +1108,40 @@
 
     function _closeSidebarMobile() {
         if (_sidebar && window.innerWidth <= 768) _sidebar.classList.remove('open');
+    }
+
+    function _enterEditMode(msgId, content) {
+        _dbg('_enterEditMode: msgId=' + msgId + ' content=' + content.substring(0, 60));
+        _editingMessageId = msgId;
+        _editingOriginalContent = content;
+        if (_chatInput) {
+            _chatInput.value = content;
+            _chatInput.style.height = 'auto';
+            _chatInput.style.height = Math.min(_chatInput.scrollHeight, 120) + 'px';
+            _chatInput.focus();
+        }
+        // Highlight the message being edited
+        document.querySelectorAll('.msg.user.editing').forEach(function (el) {
+            el.classList.remove('editing');
+        });
+        var msgEl = document.querySelector('.msg.user[data-msg-id="' + msgId + '"]');
+        if (msgEl) msgEl.classList.add('editing');
+        // Show edit banner above input
+        var banner = document.getElementById('edit-banner');
+        if (banner) banner.classList.add('show');
+        _scrollToBottom();
+    }
+
+    function _cancelEdit() {
+        _dbg('_cancelEdit called');
+        _editingMessageId = null;
+        _editingOriginalContent = '';
+        if (_chatInput) { _chatInput.value = ''; _chatInput.style.height = 'auto'; }
+        document.querySelectorAll('.msg.user.editing').forEach(function (el) {
+            el.classList.remove('editing');
+        });
+        var banner = document.getElementById('edit-banner');
+        if (banner) banner.classList.remove('show');
     }
 
     if (_chatInput) {
@@ -1086,6 +1186,8 @@
         _sidebarHistory.querySelectorAll('.session-item').forEach(function (el) {
             el.addEventListener('click', function (e) {
                 if (e.target.classList.contains('s-delete')) return;
+                _chatSending = false;
+                if (_sendBtn) _sendBtn.disabled = false;
                 _loadSession(el.getAttribute('data-id'));
                 _closeSidebarMobile();
             });
@@ -1106,11 +1208,14 @@
             _typingIndicator.classList.remove('show');
             _messagesList.appendChild(_typingIndicator);
         }
+        // Cancel any active edit
+        _cancelEdit();
     }
 
     if (_newChatBtn) {
         _newChatBtn.addEventListener('click', function () {
             _chatCurrentSessionId = null;
+            _chatSending = false;
             _sessionLoading.clear();
             if (_sendBtn) _sendBtn.disabled = false;
             if (_headerTitle) _headerTitle.textContent = 'New Chat';
@@ -1134,6 +1239,8 @@
     }
 
     function _loadSession(sessionId) {
+        // Cancel any active edit when switching sessions
+        _cancelEdit();
         // Immediately switch active session and hide any stale typing indicator
         _chatCurrentSessionId = sessionId;
         if (_typingIndicator) _typingIndicator.classList.remove('show');
@@ -1151,7 +1258,7 @@
                 var msgs = data.messages || [];
                 for (var i = 0; i < msgs.length; i++) {
                     try {
-                        _appendMessage(msgs[i].role, msgs[i].content, msgs[i].sources || []);
+                        _appendMessage(msgs[i].role, msgs[i].content, msgs[i].sources || [], msgs[i].id);
                     } catch (e) {
                         console.error('[Chat] Error rendering message', i, ':', e);
                     }
@@ -1172,6 +1279,7 @@
                 _sessionLoading.delete(sessionId);
                 if (sessionId === _chatCurrentSessionId) {
                     _chatCurrentSessionId = null;
+                    _chatSending = false;
                     if (_sendBtn) _sendBtn.disabled = false;
                     if (_headerTitle) _headerTitle.textContent = 'New Chat';
                     if (_welcomeState) _welcomeState.style.display = 'flex';
@@ -1191,6 +1299,19 @@
         var text = _chatInput.value.trim();
         if (!text) return;
 
+        // Handle edit mode — use separate _submitEdit (independent of _chatSending)
+        if (_editingMessageId) {
+            _dbg('_doSendMessage: in edit mode, calling _submitEdit with: ' + text.substring(0, 60));
+            _submitEdit(text);
+            return;
+        }
+
+        // Single sending guard: block if ANY normal request is in flight
+        if (_chatSending) {
+            _dbg('_doSendMessage: blocked by _chatSending');
+            return;
+        }
+
         // Determine the session this request belongs to (may be null for new chat)
         var requestSessionId = _chatCurrentSessionId;
         // Track the original key for clearing loading state in finally
@@ -1199,14 +1320,23 @@
         // Block if THIS session is already loading
         if (requestSessionId && _isSessionLoading(requestSessionId)) return;
 
+        _chatSending = true;
         _sessionLoading.set(loadingKey, true);
         if (_sendBtn) _sendBtn.disabled = true;
+
+        // Capture the pending user message element so we can set its ID later
+        var pendingUserMsgEl = null;
 
         try {
             if (_welcomeState) _welcomeState.style.display = 'none';
             if (_messagesContainer) _messagesContainer.style.display = 'block';
 
+            // Append the user message; we'll set data-msg-id once server responds
             _appendMessage('user', text, []);
+            // Get reference to last user message element (just appended before typing indicator)
+            if (_typingIndicator && _typingIndicator.previousSibling) {
+                pendingUserMsgEl = _typingIndicator.previousSibling;
+            }
             _chatInput.value = '';
             _chatInput.style.height = 'auto';
             _scrollToBottom();
@@ -1215,6 +1345,7 @@
             _scrollToBottom();
         } catch (e) {
             console.error('[Chat] UI error before fetch:', e);
+            _chatSending = false;
             _sessionLoading.set(loadingKey, false);
             if (_sendBtn) _sendBtn.disabled = false;
             _updateTypingIndicator();
@@ -1252,6 +1383,36 @@
                     // Update loadingKey so finally clears the correct entry
                     loadingKey = data.session_id;
 
+                    // Retroactively attach the message ID and edit button to the pending user msg
+                    if (pendingUserMsgEl && data.user_message_id) {
+                        var uid = String(data.user_message_id);
+                        pendingUserMsgEl.setAttribute('data-msg-id', uid);
+                        // Build and attach the edit button (same as _appendMessage does)
+                        var existingActions = pendingUserMsgEl.querySelector('.msg-actions');
+                        if (!existingActions) {
+                            var msgBody = pendingUserMsgEl.querySelector('.msg-body');
+                            if (msgBody) {
+                                var actionsDiv = document.createElement('div');
+                                actionsDiv.className = 'msg-actions';
+                                var editBtnEl = document.createElement('button');
+                                editBtnEl.className = 'msg-edit-btn';
+                                editBtnEl.setAttribute('data-msg-id', uid);
+                                var escapedText = text.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+                                editBtnEl.setAttribute('data-content', escapedText);
+                                editBtnEl.title = 'Edit message';
+                                editBtnEl.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>Edit';
+                                (function(btnEl, msgEl, capturedId, capturedText) {
+                                    btnEl.addEventListener('click', function(e) {
+                                        e.stopPropagation();
+                                        _enterEditMode(capturedId, capturedText);
+                                    });
+                                })(editBtnEl, pendingUserMsgEl, uid, text);
+                                actionsDiv.appendChild(editBtnEl);
+                                msgBody.appendChild(actionsDiv);
+                            }
+                        }
+                    }
+
                     var displayContent = data.answer_html || data.answer;
                     _appendMessage('assistant', displayContent, data.sources || []);
                     var matchedSess = _chatSessions.find(function (s) { return s.id === data.session_id; });
@@ -1275,9 +1436,174 @@
             }
         })
         .finally(function () {
+            _chatSending = false;
             // Clear loading state for the original request session
             _sessionLoading.set(requestSessionId, false);
             // If this was a new chat that resolved to a real session_id, clear that too
+            if (loadingKey !== requestSessionId) {
+                _sessionLoading.set(loadingKey, false);
+            }
+            _updateTypingIndicator();
+            if (_sendBtn) _sendBtn.disabled = false;
+            if (_chatInput) _chatInput.focus();
+        });
+    }
+
+    function _submitEdit(newContent) {
+        var msgId = _editingMessageId;
+        var sessionId = _chatCurrentSessionId;
+
+        _dbg('_submitEdit called: msgId=' + msgId + ' sessionId=' + sessionId +
+             ' _editSending=' + _editSending + ' _chatSending=' + _chatSending);
+
+        // Validate edit preconditions
+        if (!msgId || !sessionId) {
+            _dbg('_submitEdit: missing msgId or sessionId — cancelling edit');
+            _cancelEdit();
+            return;
+        }
+
+        // Guard: only one edit request at a time (independent of normal _chatSending)
+        if (_editSending) {
+            _dbg('_submitEdit: blocked by _editSending');
+            return;
+        }
+
+        // Capture keys for loading state tracking
+        var requestSessionId = sessionId;
+        var loadingKey = sessionId;
+
+        // ── Step 1: Clear edit mode state IMMEDIATELY (banner, input, highlight) ──
+        // This must happen before the fetch so the UI exits edit mode right away.
+        _editingMessageId = null;
+        _editingOriginalContent = '';
+        if (_chatInput) { _chatInput.value = ''; _chatInput.style.height = 'auto'; }
+        document.querySelectorAll('.msg.user.editing').forEach(function (el) {
+            el.classList.remove('editing');
+        });
+        var banner = document.getElementById('edit-banner');
+        if (banner) banner.classList.remove('show');
+        _dbg('_submitEdit: edit mode cleared, banner hidden');
+
+        // ── Step 2: Disable send and show typing indicator ──
+        _editSending = true;
+        _sessionLoading.set(loadingKey, true);
+        if (_sendBtn) _sendBtn.disabled = true;
+
+        // ── Step 3: Optimistic DOM update ──
+        // Walk the direct children of _messagesList looking for the target message.
+        // Using childNodes (not querySelectorAll('.msg')) to avoid touching the
+        // typing indicator's inner <div class="msg assistant"> child.
+        var msgIdStr = String(msgId);
+        var children = Array.prototype.slice.call(_messagesList.childNodes);
+        var foundTarget = false;
+        var toRemove = [];
+        for (var i = 0; i < children.length; i++) {
+            var node = children[i];
+            if (node.nodeType !== 1) continue;  // skip text nodes
+            if (foundTarget) {
+                // Don't remove the typing indicator outer element
+                if (node !== _typingIndicator) {
+                    toRemove.push(node);
+                }
+            } else if (node.getAttribute && node.getAttribute('data-msg-id') === msgIdStr) {
+                // Update the displayed content of the edited message
+                var contentEl = node.querySelector('.msg-content');
+                if (contentEl) contentEl.textContent = newContent;
+                // Update the edit button's data-content attribute
+                var editBtnEl = node.querySelector('.msg-edit-btn');
+                if (editBtnEl) {
+                    editBtnEl.setAttribute('data-content', newContent.replace(/'/g, "\\'").replace(/"/g, '&quot;'));
+                }
+                node.classList.remove('editing');
+                foundTarget = true;
+                _dbg('_submitEdit: found target msg in DOM, updated text');
+            }
+        }
+        // Remove stale messages (assistant reply and later turns after the edited message)
+        toRemove.forEach(function (el) { el.remove(); });
+        _dbg('_submitEdit: removed ' + toRemove.length + ' stale message(s) from DOM');
+
+        _scrollToBottom();
+        _updateTypingIndicator();
+
+        // ── Step 4: POST to /chat/edit ──
+        var payload = { message_id: msgId, session_id: sessionId, new_content: newContent };
+        _dbg('_submitEdit: POST /chat/edit payload=' + JSON.stringify(payload));
+
+        fetch('/chat/edit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        })
+        .then(function (r) {
+            _dbg('_submitEdit: HTTP status=' + r.status + ' ok=' + r.ok);
+            if (!r.ok) {
+                return r.json().then(function (errData) {
+                    throw { isJson: true, data: errData, status: r.status };
+                }, function () {
+                    throw { isJson: false, status: r.status };
+                });
+            }
+            return r.json();
+        })
+        .then(function (data) {
+            _dbg('_submitEdit: success response: session_id=' + data.session_id +
+                 ' answer_len=' + ((data.answer || '').length) +
+                 ' sources=' + (data.sources || []).length);
+            // Edit succeeded: append the new assistant response
+            if (requestSessionId === _chatCurrentSessionId) {
+                _chatCurrentSessionId = data.session_id;
+                loadingKey = data.session_id;
+                var displayContent = data.answer_html || data.answer;
+                _appendMessage('assistant', displayContent || '', data.sources || []);
+                _scrollToBottom();
+            }
+            _loadSessions();
+        })
+        .catch(function (err) {
+            _dbg('_submitEdit: CAUGHT ERROR: ' + JSON.stringify(err));
+            console.error('[Chat-Edit] Error:', err);
+            var isActive = (requestSessionId === _chatCurrentSessionId);
+            if (isActive) {
+                // Restore DOM by reloading session from DB, then show error
+                _updateTypingIndicator();
+                fetch('/chat/sessions/' + sessionId)
+                    .then(function (r) { return r.json(); })
+                    .then(function (data) {
+                        if (requestSessionId !== _chatCurrentSessionId) return;
+                        if (data.messages) {
+                            _clearMessages();
+                            for (var mi = 0; mi < data.messages.length; mi++) {
+                                _appendMessage(
+                                    data.messages[mi].role,
+                                    data.messages[mi].content,
+                                    data.messages[mi].sources || [],
+                                    data.messages[mi].id
+                                );
+                            }
+                            _scrollToBottom();
+                        }
+                        var errorMsg = 'An error occurred. Please try again.';
+                        if (err && err.isJson && err.data && err.data.error) {
+                            errorMsg = 'Error: ' + err.data.error;
+                        } else if (err && err.status) {
+                            errorMsg = 'Edit request failed (HTTP ' + err.status + '). Please try again.';
+                        }
+                        _appendMessage('assistant', errorMsg, []);
+                        _scrollToBottom();
+                    })
+                    .catch(function () {
+                        if (requestSessionId !== _chatCurrentSessionId) return;
+                        _appendMessage('assistant', 'Network error. Please try again.', []);
+                        _scrollToBottom();
+                    });
+            }
+        })
+        .finally(function () {
+            _dbg('_submitEdit: finally — clearing _editSending, re-enabling send');
+            _editSending = false;
+            _sessionLoading.set(requestSessionId, false);
             if (loadingKey !== requestSessionId) {
                 _sessionLoading.set(loadingKey, false);
             }
@@ -1297,13 +1623,25 @@
                 e.preventDefault();
                 _doSendMessage();
             }
+            if (e.key === 'Escape' && _editingMessageId) {
+                _cancelEdit();
+            }
         });
     }
 
-    function _appendMessage(role, content, sources) {
+    var _editCancelBtn = document.getElementById('edit-cancel-btn');
+    if (_editCancelBtn) {
+        _editCancelBtn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            _cancelEdit();
+        });
+    }
+
+    function _appendMessage(role, content, sources, msgId) {
         if (!_messagesList) return;
         var msgDiv = document.createElement('div');
         msgDiv.className = 'msg ' + (role || 'assistant');
+        if (msgId) msgDiv.setAttribute('data-msg-id', msgId);
 
         var avatarSvg = role === 'user'
             ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>'
@@ -1331,14 +1669,38 @@
             sourcesHtml += '</div>';
         }
 
+        var editBtnHtml = '';
+        if (role === 'user' && msgId) {
+            var escapedContent = safeContent.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+            editBtnHtml = '<div class="msg-actions">'
+                + '<button class="msg-edit-btn" data-msg-id="' + msgId + '" data-content="' + escapedContent + '" title="Edit message">'
+                + '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>'
+                + 'Edit'
+                + '</button>'
+                + '</div>';
+        }
+
         msgDiv.innerHTML = '<div class="msg-avatar" aria-hidden="true">' + avatarSvg + '</div>'
             + '<div class="msg-body">'
             + '<div class="msg-role">' + roleLabel + '</div>'
             + '<div class="msg-content">' + contentHtml + '</div>'
+            + editBtnHtml
             + sourcesHtml
             + '</div>';
 
         _messagesList.insertBefore(msgDiv, _typingIndicator);
+
+        // Attach edit button handler
+        if (role === 'user' && msgId) {
+            var editBtn = msgDiv.querySelector('.msg-edit-btn');
+            if (editBtn) {
+                editBtn.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    var rawContent = editBtn.getAttribute('data-content').replace(/&quot;/g, '"').replace(/\\'/g, "'");
+                    _enterEditMode(msgId, rawContent);
+                });
+            }
+        }
     }
 
     function _renderAssistantContent(text) {

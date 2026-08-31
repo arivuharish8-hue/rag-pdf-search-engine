@@ -218,13 +218,28 @@ Question: {query}
 Paraphrases:"""
 
     try:
+        import concurrent.futures
         from utils.gemini import _get_client
         client = _get_client()
-        response = client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=rewrite_prompt,
-            config={"max_output_tokens": 128},
-        )
+
+        def _call():
+            return client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=rewrite_prompt,
+                config={"max_output_tokens": 128},
+            )
+
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = ex.submit(_call)
+        try:
+            response = future.result(timeout=3)  # 3s hard limit
+            ex.shutdown(wait=False)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            ex.shutdown(wait=False)
+            logger.debug("[Search] Gemini rewrite timed out — skipping")
+            return []
+
         text = ""
         try:
             text = response.text
@@ -555,30 +570,17 @@ def _rescue_topically_corroborated(query, candidates, results, top_k,
             (r["pdf_name"], r["page"], r["chunk"]), 0.0
         )
 
-    corroborated_results = [
-        r for r in merged if r["topical_bm25_score"] > 0.0
-    ]
-    others = [r for r in merged if r["topical_bm25_score"] <= 0.0]
-
-    corroborated_results.sort(
+    merged.sort(
         key=lambda r: (
+            r["rerank_score"]
+            if r.get("rerank_score") is not None else float("-inf"),
             r["topical_bm25_score"],
-            r["rerank_score"]
-            if r["rerank_score"] is not None else float("-inf"),
-            r.get("hybrid_score", 0.0),
-        ),
-        reverse=True,
-    )
-    others.sort(
-        key=lambda r: (
-            r["rerank_score"]
-            if r["rerank_score"] is not None else float("-inf"),
             r.get("hybrid_score", 0.0),
         ),
         reverse=True,
     )
 
-    final = (corroborated_results + others)[:top_k]
+    final = merged[:top_k]
     logger.info(
         "[Rescue] Post-rerank: %d original + %d rescued = %d → final %d",
         len(results), len(rescued), len(merged), len(final),
@@ -1084,13 +1086,28 @@ Standalone question:"""
         return retrieval_query
 
     try:
+        import concurrent.futures
         from utils.gemini import _get_client
         client = _get_client()
-        response = client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=resolve_prompt,
-            config={"max_output_tokens": 128},
-        )
+
+        def _call():
+            return client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=resolve_prompt,
+                config={"max_output_tokens": 128},
+            )
+
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = ex.submit(_call)
+        try:
+            response = future.result(timeout=10)  # 10s hard limit — must not block gunicorn
+            ex.shutdown(wait=False)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            ex.shutdown(wait=False)
+            logger.warning("[Chat] Context resolution timed out after 10s — using raw query")
+            return retrieval_query
+
         # Extract text safely
         text = ""
         try:
@@ -1126,6 +1143,8 @@ def chat_send():
 
     Response JSON:
         session_id: session UUID (new or existing)
+        user_message_id: database ID of the persisted user message (for edit)
+        assistant_message_id: database ID of the persisted assistant message
         answer: assistant response text (with inline citations)
         answer_html: response with clickable citation links
         sources: list of cited source dicts
@@ -1135,6 +1154,11 @@ def chat_send():
     message = (data.get("message") or "").strip()
     session_id = (data.get("session_id") or "").strip() or None
 
+    logger.info(
+        "[Chat] POST /chat — session_id=%r message=%r",
+        session_id, message[:80] if message else None,
+    )
+
     if not message:
         return jsonify({"error": "Message is required"}), 400
 
@@ -1143,14 +1167,19 @@ def chat_send():
     if session_id:
         existing_session = chat_db.get_session(session_id)
         if existing_session is None:
+            logger.info("[Chat] Session %s not found — creating new", session_id)
             session_id = chat_db.create_session(
                 title=message[:60] + ("..." if len(message) > 60 else "")
             )
     else:
         title = message[:60] + ("..." if len(message) > 60 else "")
         session_id = chat_db.create_session(title=title)
+        logger.info("[Chat] New session created: %s", session_id)
 
-    chat_db.add_message(session_id, "user", message)
+    import concurrent.futures
+    _db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    user_msg_future = _db_executor.submit(chat_db.add_message, session_id, "user", message)
+    logger.info("[Chat] User message save initiated in background...")
     _perf_hist = round((time.time() - _t_hist) * 1000)
     logger.info("[PERF] session/history: %dms", _perf_hist)
 
@@ -1158,6 +1187,7 @@ def chat_send():
     answer = None
     answer_html = None
     cited_sources = []
+    assistant_message_id = None
     gemini_calls = 0
 
     try:
@@ -1294,7 +1324,21 @@ def chat_send():
         _perf_ctx = 0
 
     _t_save = time.time()
-    chat_db.add_message(session_id, "assistant", answer or "", cited_sources)
+    try:
+        user_message_id = user_msg_future.result(timeout=10)
+    except Exception as e:
+        logger.error("[Chat] User message save failed: %s", e)
+        user_message_id = None
+
+    def _save_assistant():
+        try:
+            chat_db.add_message(session_id, "assistant", answer or "", cited_sources)
+        except Exception as e:
+            logger.error("[Chat] Assistant message save failed: %s", e)
+    
+    import threading
+    threading.Thread(target=_save_assistant).start()
+    assistant_message_id = None
     _perf_save = round((time.time() - _t_save) * 1000)
     _perf_total = round((time.time() - _t_total) * 1000)
 
@@ -1304,9 +1348,234 @@ def chat_send():
         _perf_ctx, _perf_norm, _perf_retrieval, _perf_rescue1, _perf_rerank,
         _perf_rescue2, _perf_gemini, _perf_save, _perf_total, gemini_calls,
     )
+    logger.info(
+        "[Chat] Response ready: session=%s user_msg_id=%s asst_msg_id=%s "
+        "answer_len=%d sources=%d",
+        session_id, user_message_id, assistant_message_id,
+        len(answer or ""), len(cited_sources),
+    )
 
     return jsonify({
         "session_id": session_id,
+        "user_message_id": user_message_id,
+        "assistant_message_id": assistant_message_id,
+        "answer": answer,
+        "answer_html": answer_html or answer,
+        "sources": cited_sources,
+    })
+
+
+@app.route("/chat/edit", methods=["POST"])
+def chat_edit():
+    """Edit a previous user message, invalidate downstream messages, and re-run RAG.
+
+    Request JSON:
+        message_id: id of the user message to edit
+        session_id: session the message belongs to
+        new_content: edited text
+
+    Response JSON (same shape as /chat):
+        session_id, answer, answer_html, sources
+    """
+    _t_total = time.time()
+    data = request.get_json(silent=True) or {}
+    message_id = data.get("message_id")
+    session_id = (data.get("session_id") or "").strip() or None
+    new_content = (data.get("new_content") or "").strip()
+
+    logger.info(
+        "[Chat-Edit] POST /chat/edit — message_id=%r session_id=%r "
+        "new_content=%r",
+        message_id, session_id, new_content[:80] if new_content else None,
+    )
+
+    if not message_id or not session_id or not new_content:
+        logger.warning(
+            "[Chat-Edit] 400 Bad Request: message_id=%r session_id=%r "
+            "new_content_empty=%s",
+            message_id, session_id, not new_content,
+        )
+        return jsonify({"error": "message_id, session_id, and new_content are required"}), 400
+
+    # --- Validate the message exists and belongs to this session ---
+    msg = chat_db.get_message(message_id)
+    if msg is None:
+        return jsonify({"error": "Message not found"}), 404
+    if msg["session_id"] != session_id:
+        return jsonify({"error": "Message does not belong to this session"}), 403
+    if msg["role"] != "user":
+        return jsonify({"error": "Only user messages can be edited"}), 400
+
+    # --- Update the message content ---
+    chat_db.update_message_content(message_id, new_content)
+
+    # --- Delete all messages after this one (assistant reply + later turns) ---
+    chat_db.delete_messages_after(session_id, msg["created_at"])
+
+    # --- Re-run the RAG pipeline with the corrected query ---
+    _t_hist = time.time()
+    _perf_hist = round((time.time() - _t_hist) * 1000)
+
+    answer = None
+    answer_html = None
+    cited_sources = []
+    gemini_calls = 0
+
+    try:
+        if total_vectors() == 0:
+            answer = "No documents indexed. Please upload a PDF first."
+        else:
+            _t_ctx = time.time()
+            conv_history = chat_db.get_recent_messages(session_id, limit=CONTEXT_WINDOW)
+            _perf_ctx = round((time.time() - _t_ctx) * 1000)
+
+            _t_norm = time.time()
+            resolved_query = _resolve_standalone_query(new_content, conv_history)
+            retrieval_query = normalize_query(resolved_query)
+            original_normalized = normalize_query(new_content)
+            _perf_norm = round((time.time() - _t_norm) * 1000)
+
+            query_tokens = set(new_content.lower().split())
+            is_followup = bool(query_tokens & _FOLLOWUP_MARKERS)
+            if is_followup:
+                gemini_calls += 1
+
+            logger.info(
+                "[Chat-Edit] Session=%s msg_id=%s original=%r resolved=%r normalized=%r followup=%s",
+                session_id, message_id, new_content, resolved_query, retrieval_query, is_followup,
+            )
+
+            _t_retrieval = time.time()
+            skip_rewrites = (not is_followup and original_normalized == retrieval_query)
+            candidates = _multi_variant_search(
+                retrieval_query, RERANK_CANDIDATES, skip_rewrites=skip_rewrites
+            )
+            if not skip_rewrites:
+                gemini_calls += 1
+
+            if original_normalized != retrieval_query:
+                emb_orig = create_query_embedding(original_normalized)
+                cands_orig = hybrid_search(
+                    original_normalized, emb_orig, top_k=RERANK_CANDIDATES
+                )
+                seen = {(c["pdf_name"], c["page"], c["chunk"]) for c in candidates}
+                for c in cands_orig:
+                    key = (c["pdf_name"], c["page"], c["chunk"])
+                    if key not in seen:
+                        candidates.append(c)
+                        seen.add(key)
+            _perf_retrieval = round((time.time() - _t_retrieval) * 1000)
+
+            _RERANKER_MAX = RERANK_CANDIDATES * 3
+            if len(candidates) > _RERANKER_MAX:
+                candidates.sort(key=lambda c: c.get("hybrid_score", 0.0), reverse=True)
+                candidates = candidates[:_RERANKER_MAX]
+
+            _t_rescue1 = time.time()
+            candidates = _rescue_topically_corroborated(
+                retrieval_query, candidates, candidates, RERANK_CANDIDATES,
+                normalized_query=retrieval_query,
+            )
+            _perf_rescue1 = round((time.time() - _t_rescue1) * 1000)
+
+            _t_rerank = time.time()
+            results = rerank(retrieval_query, candidates, top_k=RERANK_TOP_K)
+            _perf_rerank = round((time.time() - _t_rerank) * 1000)
+
+            _t_rescue2 = time.time()
+            results = _rescue_topically_corroborated(
+                retrieval_query, candidates, results, RERANK_CANDIDATES,
+                normalized_query=retrieval_query,
+            )
+            _perf_rescue2 = round((time.time() - _t_rescue2) * 1000)
+
+            _t_gemini = time.time()
+            if results:
+                results, citations = build_citation_map(results)
+                for result in results:
+                    result["pdf_url"] = pdf_url_for(result)
+                    result["display_pdf_name"] = display_pdf_name(
+                        result["pdf_name"]
+                    )
+                try:
+                    answer = generate_answer(new_content, results)
+                    gemini_calls += 1
+                except GeminiGenerationError as exc:
+                    logger.error(
+                        "[Chat-Edit] Gemini generation failed (kind=%s): %s",
+                        exc.kind, exc, exc_info=True,
+                    )
+                    answer = _fallback_answer(results, exc)
+                if answer:
+                    answer = validate_answer(answer, citations)
+                    answer_html = render_answer_links(
+                        answer, citations, pdf_url_for
+                    )
+                    cited_ids = extract_cited_ids(answer)
+                    deduped = {}
+                    for cit in citations:
+                        if cit["citation_id"] in cited_ids:
+                            key = (cit["pdf_name"], cit["page"])
+                            if key not in deduped:
+                                deduped[key] = {
+                                    "citation_ids": [str(cit["citation_id"])],
+                                    "pdf_name": cit["pdf_name"],
+                                    "display_pdf_name": display_pdf_name(cit["pdf_name"]),
+                                    "page": cit["page"],
+                                    "chunks": [str(cit["chunk"])],
+                                    "pdf_url": pdf_url_for(cit),
+                                }
+                            else:
+                                deduped[key]["citation_ids"].append(str(cit["citation_id"]))
+                                if str(cit["chunk"]) not in deduped[key]["chunks"]:
+                                    deduped[key]["chunks"].append(str(cit["chunk"]))
+                    cited_sources = list(deduped.values())
+            else:
+                answer = (
+                    "I couldn't find relevant information in the uploaded "
+                    "documents for this question."
+                )
+            _perf_gemini = round((time.time() - _t_gemini) * 1000)
+    except Exception as exc:
+        logger.error("[Chat-Edit] Error processing message: %s", exc, exc_info=True)
+        answer = "An error occurred while processing your question. Please try again."
+        _perf_gemini = 0
+        _perf_retrieval = 0
+        _perf_rerank = 0
+        _perf_rescue1 = 0
+        _perf_rescue2 = 0
+        _perf_norm = 0
+        _perf_ctx = 0
+
+    _t_save = time.time()
+    def _save_assistant_edit():
+        try:
+            chat_db.add_message(session_id, "assistant", answer or "", cited_sources)
+        except Exception as e:
+            logger.error("[Chat-Edit] Assistant message save failed: %s", e)
+    
+    import threading
+    threading.Thread(target=_save_assistant_edit).start()
+    assistant_message_id = None
+    _perf_save = round((time.time() - _t_save) * 1000)
+    _perf_total = round((time.time() - _t_total) * 1000)
+
+    logger.info(
+        "[PERF-Edit] ctx=%dms norm=%dms retrieval=%dms rescue1=%dms reranker=%dms "
+        "rescue2=%dms gemini=%dms save=%dms total=%dms gemini_calls=%d",
+        _perf_ctx, _perf_norm, _perf_retrieval, _perf_rescue1, _perf_rerank,
+        _perf_rescue2, _perf_gemini, _perf_save, _perf_total, gemini_calls,
+    )
+    logger.info(
+        "[Chat-Edit] Response ready: session=%s asst_msg_id=%s "
+        "answer_len=%d sources=%d",
+        session_id, assistant_message_id,
+        len(answer or ""), len(cited_sources),
+    )
+
+    return jsonify({
+        "session_id": session_id,
+        "assistant_message_id": assistant_message_id,
         "answer": answer,
         "answer_html": answer_html or answer,
         "sources": cited_sources,
